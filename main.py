@@ -5,8 +5,8 @@ import os
 app = FastAPI()
 
 def get_trading_client():
-    api_key = os.getenv("PKP4UMGKFIY6SZSX2PNW6N5VYA")
-    secret_key = os.getenv("J3Qdohdi7DsiGxim8FpRJG6iDeivRfpB5yA6idDAS4xj")
+    api_key = os.getenv("PKEUUOS72WARK3POSHAOTDV3Q7")
+    secret_key = os.getenv("2rr8dabLWWznHyfmPpCErDJG6ZmTSeEaBSGgqg21fo5L")
     return TradingClient(api_key, secret_key, paper=True)
 
 @app.get("/")
