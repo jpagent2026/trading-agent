@@ -1,16 +1,30 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from alpaca.trading.client import TradingClient
 import os
 
 app = FastAPI()
 
+def get_trading_client():
+    api_key = os.getenv("PKP4UMGKFIY6SZSX2PNW6N5VYA")
+    secret_key = os.getenv("J3Qdohdi7DsiGxim8FpRJG6iDeivRfpB5yA6idDAS4xj")
+    return TradingClient(api_key, secret_key, paper=True)
+
 @app.get("/")
 def home():
-    api_key = os.getenv("ALPACA_API_KEY")
-    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    try:
+        client = get_trading_client()
+        account = client.get_account()
+        return {
+            "status": "Trading agent is running",
+            "mode": "paper",
+            "equity": str(account.equity),
+            "buying_power": str(account.buying_power)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-    return {
-        "api_key_found": bool(api_key),
-        "secret_key_found": bool(secret_key),
-        "api_key_length": len(api_key) if api_key else 0,
-        "secret_key_length": len(secret_key) if secret_key else 0
-    }
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    print("Received webhook:", data)
+    return {"status": "received", "data": data}
