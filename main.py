@@ -8,10 +8,9 @@ import pytz
 
 app = FastAPI()
 
-# === RISK SETTINGS ===
 MAX_POSITIONS = 4
-RISK_PER_TRADE_PCT = 5.0
 DAILY_LOSS_LIMIT_PCT = 3.0
+TEST_QTY = 3   # Temporary fixed quantity for testing
 
 def get_trading_client():
     api_key = os.getenv("ALPACA_API_KEY")
@@ -41,28 +40,6 @@ def check_daily_loss_limit(client):
     if change_pct <= -DAILY_LOSS_LIMIT_PCT:
         return False, change_pct
     return True, change_pct
-
-def calculate_shares(client, ticker, risk_pct=RISK_PER_TRADE_PCT):
-    """Calculate whole shares based on % of equity"""
-    account = client.get_account()
-    equity = float(account.equity)
-    dollar_amount = equity * (risk_pct / 100)
-
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockLatestTradeRequest
-
-    data_client = StockHistoricalDataClient(
-        os.getenv("ALPACA_API_KEY"),
-        os.getenv("ALPACA_SECRET_KEY")
-    )
-    trade = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
-    price = float(trade[ticker].price)
-
-    if price <= 0:
-        return 0
-
-    shares = int(dollar_amount / price)
-    return max(shares, 0)
 
 @app.get("/")
 def home():
@@ -115,13 +92,8 @@ async def webhook(request: Request):
             if open_count >= MAX_POSITIONS:
                 print(f"Max positions ({MAX_POSITIONS}) reached. Ignoring buy.")
                 return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
-
-            print(f"Calculating shares for {ticker}...")
-            qty = calculate_shares(client, ticker)
-            print(f"Calculated qty: {qty}")
-            if qty <= 0:
-                print("Could not calculate valid share quantity")
-                return {"status": "error", "message": "Could not calculate valid share quantity"}
+            qty = TEST_QTY
+            print(f"Using test quantity: {qty}")
         else:
             try:
                 qty = int(float(data.get("qty", 0)))
