@@ -1,3 +1,84 @@
+from fastapi import FastAPI, Request
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from datetime import datetime
+import os
+import pytz
+
+app = FastAPI()
+
+# === RISK SETTINGS ===
+MAX_POSITIONS = 4
+RISK_PER_TRADE_PCT = 5.0
+DAILY_LOSS_LIMIT_PCT = 3.0
+
+def get_trading_client():
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    return TradingClient(api_key, secret_key, paper=True)
+
+def is_regular_market_hours():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+def get_open_positions_count(client):
+    positions = client.get_all_positions()
+    return len(positions)
+
+def check_daily_loss_limit(client):
+    account = client.get_account()
+    equity = float(account.equity)
+    last_equity = float(account.last_equity)
+    if last_equity <= 0:
+        return True, 0.0
+    change_pct = ((equity - last_equity) / last_equity) * 100
+    if change_pct <= -DAILY_LOSS_LIMIT_PCT:
+        return False, change_pct
+    return True, change_pct
+
+def calculate_shares(client, ticker, risk_pct=RISK_PER_TRADE_PCT):
+    """Calculate whole shares based on % of equity"""
+    account = client.get_account()
+    equity = float(account.equity)
+    dollar_amount = equity * (risk_pct / 100)
+
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestTradeRequest
+
+    data_client = StockHistoricalDataClient(
+        os.getenv("ALPACA_API_KEY"),
+        os.getenv("ALPACA_SECRET_KEY")
+    )
+    trade = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
+    price = float(trade[ticker].price)
+
+    if price <= 0:
+        return 0
+
+    shares = int(dollar_amount / price)
+    return max(shares, 0)
+
+@app.get("/")
+def home():
+    try:
+        client = get_trading_client()
+        account = client.get_account()
+        return {
+            "status": "Trading agent is running",
+            "mode": "paper",
+            "equity": str(account.equity),
+            "buying_power": str(account.buying_power),
+            "open_positions": get_open_positions_count(client)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -22,7 +103,6 @@ async def webhook(request: Request):
         client = get_trading_client()
         print("Trading client created successfully")
 
-        # Daily loss limit
         can_trade, daily_change = check_daily_loss_limit(client)
         print(f"Daily change: {daily_change:.2f}%")
         if not can_trade:
