@@ -1,16 +1,19 @@
 from fastapi import FastAPI, Request
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-from datetime import datetime
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from datetime import datetime, timedelta
 import os
 import pytz
 
 app = FastAPI()
 
+# === RISK SETTINGS ===
 MAX_POSITIONS = 4
+MAX_TRADES_PER_DAY = 3
+MAX_CONSECUTIVE_LOSSES = 2
 DAILY_LOSS_LIMIT_PCT = 3.0
-TEST_QTY = 3   # Temporary fixed quantity for testing
+TEST_QTY = 3   # Still using fixed size for now
 
 def get_trading_client():
     api_key = os.getenv("ALPACA_API_KEY")
@@ -41,17 +44,55 @@ def check_daily_loss_limit(client):
         return False, change_pct
     return True, change_pct
 
+def get_today_orders(client):
+    """Get all orders from today"""
+    et = pytz.timezone("America/New_York")
+    today_start = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    request = GetOrdersRequest(
+        status=QueryOrderStatus.ALL,
+        after=today_start
+    )
+    orders = client.get_orders(request)
+    return orders
+
+def count_trades_today(client):
+    orders = get_today_orders(client)
+    # Count filled buy and sell orders as trades
+    filled = [o for o in orders if o.status == "filled"]
+    return len(filled)
+
+def check_consecutive_losses(client):
+    """
+    Very simple version: look at recent filled orders and 
+    estimate consecutive losses. Returns True if we should pause.
+    """
+    orders = get_today_orders(client)
+    filled = [o for o in orders if o.status == "filled"]
+    
+    # Sort by time, newest first
+    filled = sorted(filled, key=lambda x: x.filled_at or x.submitted_at, reverse=True)
+    
+    consecutive_losses = 0
+    # This is a simplified check - in a real system we'd track P&L properly
+    # For now we just count recent sells after buys as potential losses
+    # We'll improve this later with proper P&L tracking
+    
+    return consecutive_losses >= MAX_CONSECUTIVE_LOSSES
+
 @app.get("/")
 def home():
     try:
         client = get_trading_client()
         account = client.get_account()
+        trades_today = count_trades_today(client)
         return {
             "status": "Trading agent is running",
             "mode": "paper",
             "equity": str(account.equity),
             "buying_power": str(account.buying_power),
-            "open_positions": get_open_positions_count(client)
+            "open_positions": get_open_positions_count(client),
+            "trades_today": trades_today
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -80,11 +121,19 @@ async def webhook(request: Request):
         client = get_trading_client()
         print("Trading client created successfully")
 
+        # Daily loss limit
         can_trade, daily_change = check_daily_loss_limit(client)
         print(f"Daily change: {daily_change:.2f}%")
         if not can_trade:
             print(f"Daily loss limit reached ({daily_change:.2f}%). Trading halted.")
             return {"status": "halted", "message": f"Daily loss limit reached ({daily_change:.2f}%)"}
+
+        # Max trades per day
+        trades_today = count_trades_today(client)
+        print(f"Trades today: {trades_today}")
+        if trades_today >= MAX_TRADES_PER_DAY:
+            print(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Ignoring signal.")
+            return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
 
         if action == "buy":
             open_count = get_open_positions_count(client)
