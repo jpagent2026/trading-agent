@@ -129,4 +129,59 @@ async def webhook(request: Request):
             print(f"Daily loss limit reached ({daily_change:.2f}%). Trading halted.")
             return {"status": "halted", "message": f"Daily loss limit reached ({daily_change:.2f}%)"}
 
-        trades_today = 
+        trades_today = count_trades_today(client)
+        print(f"Trades today: {trades_today}")
+        if trades_today >= MAX_TRADES_PER_DAY:
+            print(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Ignoring signal.")
+            return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
+
+        if action == "buy":
+            if sold_ticker_today(client, ticker):
+                print(f"Already sold {ticker} today. Ignoring same-day re-buy.")
+                return {"status": "ignored", "message": f"Already sold {ticker} today"}
+
+            open_count = get_open_positions_count(client)
+            print(f"Open positions: {open_count}")
+            if open_count >= MAX_POSITIONS:
+                print(f"Max positions ({MAX_POSITIONS}) reached. Ignoring buy.")
+                return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
+            qty = TEST_QTY
+            print(f"Using test quantity: {qty}")
+
+        else:  # sell
+            current_qty = get_position_qty(client, ticker)
+            print(f"Current long position in {ticker}: {current_qty}")
+            if current_qty <= 0:
+                print(f"No long position in {ticker}. Ignoring sell to avoid shorting.")
+                return {"status": "ignored", "message": f"No long position in {ticker}"}
+            try:
+                requested_qty = int(float(data.get("qty", current_qty)))
+            except Exception:
+                requested_qty = int(current_qty)
+            qty = min(requested_qty, int(current_qty))
+            print(f"Selling {qty} shares of {ticker}")
+
+        print(f"Submitting order: {action} {qty} {ticker}")
+        side = OrderSide.BUY if action == "buy" else OrderSide.SELL
+        order_data = MarketOrderRequest(
+            symbol=ticker,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY
+        )
+
+        order = client.submit_order(order_data)
+        print(f"PAPER TRADE PLACED: {action.upper()} {qty} {ticker} | Order ID: {order.id}")
+
+        return {
+            "status": "success",
+            "message": f"Paper trade placed: {action} {qty} {ticker}",
+            "order_id": str(order.id),
+            "qty": qty
+        }
+
+    except Exception as e:
+        print(f"ORDER FAILED - FULL ERROR: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
