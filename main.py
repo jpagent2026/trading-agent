@@ -28,12 +28,16 @@ def is_regular_market_hours():
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return market_open <= now <= market_close
 
+def get_today_start():
+    et = pytz.timezone("America/New_York")
+    return datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+
 def get_open_positions_count(client):
     positions = client.get_all_positions()
     return len(positions)
 
 def get_position_qty(client, ticker):
-    """Return the current long quantity for a ticker. 0 if none."""
+    """Return current long quantity for a ticker. 0 if none."""
     try:
         position = client.get_open_position(ticker)
         qty = float(position.qty)
@@ -52,13 +56,32 @@ def check_daily_loss_limit(client):
         return False, change_pct
     return True, change_pct
 
+def get_today_orders(client):
+    request = GetOrdersRequest(
+        status=QueryOrderStatus.ALL,
+        after=get_today_start()
+    )
+    return client.get_orders(request)
+
 def count_trades_today(client):
-    et = pytz.timezone("America/New_York")
-    today_start = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
-    request = GetOrdersRequest(status=QueryOrderStatus.ALL, after=today_start)
-    orders = client.get_orders(request)
-    filled = [o for o in orders if str(o.status).lower() == "filled"]
+    orders = get_today_orders(client)
+    filled = []
+    for o in orders:
+        status = str(getattr(o.status, "value", o.status)).lower()
+        if status == "filled":
+            filled.append(o)
     return len(filled)
+
+def sold_ticker_today(client, ticker):
+    """True if we already sold this ticker today."""
+    orders = get_today_orders(client)
+    for o in orders:
+        symbol = str(getattr(o, "symbol", "")).upper()
+        side = str(getattr(o.side, "value", o.side)).lower()
+        status = str(getattr(o.status, "value", o.status)).lower()
+        if symbol == ticker.upper() and side == "sell" and status in ["filled", "partially_filled", "new", "accepted", "pending_new"]:
+            return True
+    return False
 
 @app.get("/")
 def home():
@@ -106,56 +129,4 @@ async def webhook(request: Request):
             print(f"Daily loss limit reached ({daily_change:.2f}%). Trading halted.")
             return {"status": "halted", "message": f"Daily loss limit reached ({daily_change:.2f}%)"}
 
-        trades_today = count_trades_today(client)
-        print(f"Trades today: {trades_today}")
-        if trades_today >= MAX_TRADES_PER_DAY:
-            print(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Ignoring signal.")
-            return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
-
-        if action == "buy":
-            open_count = get_open_positions_count(client)
-            print(f"Open positions: {open_count}")
-            if open_count >= MAX_POSITIONS:
-                print(f"Max positions ({MAX_POSITIONS}) reached. Ignoring buy.")
-                return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
-            qty = TEST_QTY
-            print(f"Using test quantity: {qty}")
-
-        else:  # sell
-            current_qty = get_position_qty(client, ticker)
-            print(f"Current long position in {ticker}: {current_qty}")
-            if current_qty <= 0:
-                print(f"No long position in {ticker}. Ignoring sell to avoid shorting.")
-                return {"status": "ignored", "message": f"No long position in {ticker}"}
-            # Sell only what we actually hold (up to the requested qty)
-            try:
-                requested_qty = int(float(data.get("qty", current_qty)))
-            except:
-                requested_qty = int(current_qty)
-            qty = min(requested_qty, int(current_qty))
-            print(f"Selling {qty} shares of {ticker}")
-
-        print(f"Submitting order: {action} {qty} {ticker}")
-        side = OrderSide.BUY if action == "buy" else OrderSide.SELL
-        order_data = MarketOrderRequest(
-            symbol=ticker,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.DAY
-        )
-
-        order = client.submit_order(order_data)
-        print(f"PAPER TRADE PLACED: {action.upper()} {qty} {ticker} | Order ID: {order.id}")
-
-        return {
-            "status": "success",
-            "message": f"Paper trade placed: {action} {qty} {ticker}",
-            "order_id": str(order.id),
-            "qty": qty
-        }
-
-    except Exception as e:
-        print(f"ORDER FAILED - FULL ERROR: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"status": "error", "message": str(e)}
+        trades_today = 
