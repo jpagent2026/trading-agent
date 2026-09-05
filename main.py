@@ -63,23 +63,37 @@ def get_today_orders(client):
     )
     return client.get_orders(request)
 
+def order_status_str(order):
+    return str(getattr(order.status, "value", order.status)).lower()
+
+def order_side_str(order):
+    return str(getattr(order.side, "value", order.side)).lower()
+
 def count_trades_today(client):
     orders = get_today_orders(client)
-    filled = []
-    for o in orders:
-        status = str(getattr(o.status, "value", o.status)).lower()
-        if status == "filled":
-            filled.append(o)
+    filled = [o for o in orders if order_status_str(o) == "filled"]
     return len(filled)
 
 def sold_ticker_today(client, ticker):
     """True if we already sold this ticker today."""
-    orders = get_today_orders(client)
-    for o in orders:
+    for o in get_today_orders(client):
         symbol = str(getattr(o, "symbol", "")).upper()
-        side = str(getattr(o.side, "value", o.side)).lower()
-        status = str(getattr(o.status, "value", o.status)).lower()
-        if symbol == ticker.upper() and side == "sell" and status in ["filled", "partially_filled", "new", "accepted", "pending_new"]:
+        if symbol == ticker.upper() and order_side_str(o) == "sell" and order_status_str(o) in [
+            "filled", "partially_filled", "new", "accepted", "pending_new"
+        ]:
+            return True
+    return False
+
+def has_pending_order(client, ticker):
+    """True if this ticker already has an open/pending order."""
+    pending_statuses = {
+        "new", "accepted", "pending_new", "accepted_for_bidding",
+        "pending_replace", "pending_cancel", "partially_filled"
+    }
+    request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+    for o in client.get_orders(request):
+        symbol = str(getattr(o, "symbol", "")).upper()
+        if symbol == ticker.upper() and order_status_str(o) in pending_statuses:
             return True
     return False
 
@@ -135,7 +149,17 @@ async def webhook(request: Request):
             print(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Ignoring signal.")
             return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
 
+        if has_pending_order(client, ticker):
+            print(f"Pending order already exists for {ticker}. Ignoring {action}.")
+            return {"status": "ignored", "message": f"Pending order exists for {ticker}"}
+
         if action == "buy":
+            current_qty = get_position_qty(client, ticker)
+            print(f"Current long position in {ticker}: {current_qty}")
+            if current_qty > 0:
+                print(f"Already long {ticker}. Ignoring add-on buy.")
+                return {"status": "ignored", "message": f"Already long {ticker}"}
+
             if sold_ticker_today(client, ticker):
                 print(f"Already sold {ticker} today. Ignoring same-day re-buy.")
                 return {"status": "ignored", "message": f"Already sold {ticker} today"}
@@ -145,6 +169,7 @@ async def webhook(request: Request):
             if open_count >= MAX_POSITIONS:
                 print(f"Max positions ({MAX_POSITIONS}) reached. Ignoring buy.")
                 return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
+
             qty = TEST_QTY
             print(f"Using test quantity: {qty}")
 
