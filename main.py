@@ -33,11 +33,9 @@ def get_today_start():
     return datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
 
 def get_open_positions_count(client):
-    positions = client.get_all_positions()
-    return len(positions)
+    return len(client.get_all_positions())
 
 def get_position_qty(client, ticker):
-    """Return current long quantity for a ticker. 0 if none."""
     try:
         position = client.get_open_position(ticker)
         qty = float(position.qty)
@@ -70,22 +68,28 @@ def order_side_str(order):
     return str(getattr(order.side, "value", order.side)).lower()
 
 def count_trades_today(client):
-    orders = get_today_orders(client)
-    filled = [o for o in orders if order_status_str(o) == "filled"]
-    return len(filled)
+    return len([o for o in get_today_orders(client) if order_status_str(o) == "filled"])
 
-def sold_ticker_today(client, ticker):
-    """True if we already sold this ticker today."""
+def ticker_side_today(client, ticker, side):
     for o in get_today_orders(client):
         symbol = str(getattr(o, "symbol", "")).upper()
-        if symbol == ticker.upper() and order_side_str(o) == "sell" and order_status_str(o) in [
-            "filled", "partially_filled", "new", "accepted", "pending_new"
-        ]:
+        if (
+            symbol == ticker.upper()
+            and order_side_str(o) == side
+            and order_status_str(o) in [
+                "filled", "partially_filled", "new", "accepted", "pending_new"
+            ]
+        ):
             return True
     return False
 
+def sold_ticker_today(client, ticker):
+    return ticker_side_today(client, ticker, "sell")
+
+def bought_ticker_today(client, ticker):
+    return ticker_side_today(client, ticker, "buy")
+
 def has_pending_order(client, ticker):
-    """True if this ticker already has an open/pending order."""
     pending_statuses = {
         "new", "accepted", "pending_new", "accepted_for_bidding",
         "pending_replace", "pending_cancel", "partially_filled"
@@ -179,6 +183,11 @@ async def webhook(request: Request):
             if current_qty <= 0:
                 print(f"No long position in {ticker}. Ignoring sell to avoid shorting.")
                 return {"status": "ignored", "message": f"No long position in {ticker}"}
+
+            if bought_ticker_today(client, ticker):
+                print(f"Bought {ticker} today. Ignoring same-day sell.")
+                return {"status": "ignored", "message": f"Bought {ticker} today. Hold until next session."}
+
             try:
                 requested_qty = int(float(data.get("qty", current_qty)))
             except Exception:
