@@ -14,6 +14,35 @@ MAX_TRADES_PER_DAY = 3
 DAILY_LOSS_LIMIT_PCT = 3.0
 TEST_QTY = 3
 
+# === PHASE 2 STEP 1: watchlist gate only ===
+# Env override example: WATCHLIST=AAPL,MSFT,NVDA
+DEFAULT_WATCHLIST = ("AAPL", "MSFT", "NVDA")
+
+
+def load_watchlist():
+    raw = os.getenv("WATCHLIST", "")
+    parts = [p.strip().upper() for p in raw.replace(";", ",").split(",") if p.strip()]
+    return set(parts) if parts else set(DEFAULT_WATCHLIST)
+
+
+WATCHLIST = load_watchlist()
+
+
+def normalize_ticker(ticker):
+    t = (ticker or "").strip().upper()
+    if ":" in t:
+        t = t.split(":")[-1]
+    if "." in t:
+        t = t.split(".")[0]
+    if "-" in t:
+        t = t.split("-")[0]
+    return t
+
+
+def on_watchlist(ticker):
+    return ticker in WATCHLIST
+
+
 def get_trading_client():
     api_key = os.getenv("ALPACA_API_KEY")
     secret_key = os.getenv("ALPACA_SECRET_KEY")
@@ -112,7 +141,8 @@ def home():
             "equity": str(account.equity),
             "buying_power": str(account.buying_power),
             "open_positions": get_open_positions_count(client),
-            "trades_today": count_trades_today(client)
+            "trades_today": count_trades_today(client),
+            "watchlist": sorted(WATCHLIST),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -123,7 +153,7 @@ async def webhook(request: Request):
     print("Received webhook:", data)
 
     action = data.get("action", "").lower()
-    ticker = data.get("ticker", "").upper()
+    ticker = normalize_ticker(data.get("ticker", ""))
 
     if action not in ["buy", "sell"]:
         print("Ignored: action must be buy or sell")
@@ -132,6 +162,10 @@ async def webhook(request: Request):
     if not ticker:
         print("Error: ticker required")
         return {"status": "error", "message": "ticker required"}
+
+    if not on_watchlist(ticker):
+        print(f"WATCHLIST_REJECT symbol={ticker} action={action} src=tv")
+        return {"status": "ignored", "reason": "not_on_watchlist", "ticker": ticker}
 
     if not is_regular_market_hours():
         print(f"Signal ignored - outside regular market hours: {action} {ticker}")
