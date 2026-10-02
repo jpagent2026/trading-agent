@@ -14,9 +14,12 @@ MAX_TRADES_PER_DAY = 3
 DAILY_LOSS_LIMIT_PCT = 3.0
 TEST_QTY = 3
 
-# === PHASE 2 STEP 1: watchlist gate only ===
-# Env override example: WATCHLIST=AAPL,MSFT,NVDA
+# === PHASE 2 STEP 1: watchlist gate ===
 DEFAULT_WATCHLIST = ("AAPL", "MSFT", "NVDA")
+
+# === PHASE 2 STEP 2: signal log (log only, no new veto) ===
+SIGNAL_LOG = []
+SIGNAL_LOG_MAX = 200
 
 
 def load_watchlist():
@@ -26,6 +29,7 @@ def load_watchlist():
 
 
 WATCHLIST = load_watchlist()
+ET = pytz.timezone("America/New_York")
 
 
 def normalize_ticker(ticker):
@@ -43,14 +47,36 @@ def on_watchlist(ticker):
     return ticker in WATCHLIST
 
 
+def now_et():
+    return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+
+
+def log_signal(action, ticker, result, reason):
+    """One line per webhook. result is allowed or blocked. Does not veto."""
+    row = {
+        "time": now_et(),
+        "ticker": ticker or "",
+        "action": action or "",
+        "result": result,
+        "reason": reason,
+    }
+    SIGNAL_LOG.append(row)
+    if len(SIGNAL_LOG) > SIGNAL_LOG_MAX:
+        del SIGNAL_LOG[: len(SIGNAL_LOG) - SIGNAL_LOG_MAX]
+    print(
+        f"SIGNAL time={row['time']} ticker={row['ticker']} "
+        f"action={row['action']} result={row['result']} reason={row['reason']}"
+    )
+    return row
+
+
 def get_trading_client():
     api_key = os.getenv("ALPACA_API_KEY")
     secret_key = os.getenv("ALPACA_SECRET_KEY")
     return TradingClient(api_key, secret_key, paper=True)
 
 def is_regular_market_hours():
-    et = pytz.timezone("America/New_York")
-    now = datetime.now(et)
+    now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -58,8 +84,7 @@ def is_regular_market_hours():
     return market_open <= now <= market_close
 
 def get_today_start():
-    et = pytz.timezone("America/New_York")
-    return datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+    return datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
 
 def get_open_positions_count(client):
     return len(client.get_all_positions())
@@ -143,9 +168,14 @@ def home():
             "open_positions": get_open_positions_count(client),
             "trades_today": count_trades_today(client),
             "watchlist": sorted(WATCHLIST),
+            "signals_kept": len(SIGNAL_LOG),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/signals")
+def signals():
+    return {"count": len(SIGNAL_LOG), "signals": SIGNAL_LOG[-50:]}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -156,18 +186,20 @@ async def webhook(request: Request):
     ticker = normalize_ticker(data.get("ticker", ""))
 
     if action not in ["buy", "sell"]:
-        print("Ignored: action must be buy or sell")
+        log_signal(action, ticker, "blocked", "action must be buy or sell")
         return {"status": "ignored", "message": "action must be buy or sell"}
 
     if not ticker:
-        print("Error: ticker required")
+        log_signal(action, ticker, "blocked", "ticker required")
         return {"status": "error", "message": "ticker required"}
 
     if not on_watchlist(ticker):
+        log_signal(action, ticker, "blocked", "not_on_watchlist")
         print(f"WATCHLIST_REJECT symbol={ticker} action={action} src=tv")
         return {"status": "ignored", "reason": "not_on_watchlist", "ticker": ticker}
 
     if not is_regular_market_hours():
+        log_signal(action, ticker, "blocked", "outside regular market hours")
         print(f"Signal ignored - outside regular market hours: {action} {ticker}")
         return {"status": "ignored", "message": "Outside regular market hours"}
 
@@ -178,16 +210,20 @@ async def webhook(request: Request):
         can_trade, daily_change = check_daily_loss_limit(client)
         print(f"Daily change: {daily_change:.2f}%")
         if not can_trade:
+            reason = f"daily loss limit {daily_change:.2f}%"
+            log_signal(action, ticker, "blocked", reason)
             print(f"Daily loss limit reached ({daily_change:.2f}%). Trading halted.")
             return {"status": "halted", "message": f"Daily loss limit reached ({daily_change:.2f}%)"}
 
         trades_today = count_trades_today(client)
         print(f"Trades today: {trades_today}")
         if trades_today >= MAX_TRADES_PER_DAY:
+            log_signal(action, ticker, "blocked", f"max trades per day ({MAX_TRADES_PER_DAY})")
             print(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Ignoring signal.")
             return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
 
         if has_pending_order(client, ticker):
+            log_signal(action, ticker, "blocked", "pending order exists")
             print(f"Pending order already exists for {ticker}. Ignoring {action}.")
             return {"status": "ignored", "message": f"Pending order exists for {ticker}"}
 
@@ -195,16 +231,19 @@ async def webhook(request: Request):
             current_qty = get_position_qty(client, ticker)
             print(f"Current long position in {ticker}: {current_qty}")
             if current_qty > 0:
+                log_signal(action, ticker, "blocked", "already long")
                 print(f"Already long {ticker}. Ignoring add-on buy.")
                 return {"status": "ignored", "message": f"Already long {ticker}"}
 
             if sold_ticker_today(client, ticker):
+                log_signal(action, ticker, "blocked", "already sold today")
                 print(f"Already sold {ticker} today. Ignoring same-day re-buy.")
                 return {"status": "ignored", "message": f"Already sold {ticker} today"}
 
             open_count = get_open_positions_count(client)
             print(f"Open positions: {open_count}")
             if open_count >= MAX_POSITIONS:
+                log_signal(action, ticker, "blocked", f"max positions ({MAX_POSITIONS})")
                 print(f"Max positions ({MAX_POSITIONS}) reached. Ignoring buy.")
                 return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
 
@@ -215,10 +254,12 @@ async def webhook(request: Request):
             current_qty = get_position_qty(client, ticker)
             print(f"Current long position in {ticker}: {current_qty}")
             if current_qty <= 0:
+                log_signal(action, ticker, "blocked", "no long position")
                 print(f"No long position in {ticker}. Ignoring sell to avoid shorting.")
                 return {"status": "ignored", "message": f"No long position in {ticker}"}
 
             if bought_ticker_today(client, ticker):
+                log_signal(action, ticker, "blocked", "bought today")
                 print(f"Bought {ticker} today. Ignoring same-day sell.")
                 return {"status": "ignored", "message": f"Bought {ticker} today. Hold until next session."}
 
@@ -240,6 +281,7 @@ async def webhook(request: Request):
 
         order = client.submit_order(order_data)
         print(f"PAPER TRADE PLACED: {action.upper()} {qty} {ticker} | Order ID: {order.id}")
+        log_signal(action, ticker, "allowed", f"paper {action} {qty} order {order.id}")
 
         return {
             "status": "success",
@@ -252,4 +294,5 @@ async def webhook(request: Request):
         print(f"ORDER FAILED - FULL ERROR: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
+        log_signal(action, ticker, "blocked", f"order failed {type(e).__name__}")
         return {"status": "error", "message": str(e)}
