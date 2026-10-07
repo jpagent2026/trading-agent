@@ -47,6 +47,28 @@ def on_watchlist(ticker):
     return ticker in WATCHLIST
 
 
+# === PHASE 2 STEP 3: optional confirm ===
+# Missing confirm = EMA9 path, still trades.
+# "confirm": false blocks. "confirm": true passes into the same risk rules.
+
+def confirm_allows(data):
+    if "confirm" not in data:
+        return True, "no confirm field"
+    value = data.get("confirm")
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("true", "1", "yes"):
+            return True, "confirm true"
+        if value in ("false", "0", "no"):
+            return False, "confirm false"
+        return False, "confirm invalid"
+    if value is True:
+        return True, "confirm true"
+    if value is False:
+        return False, "confirm false"
+    return False, "confirm invalid"
+
+
 def now_et():
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
@@ -197,6 +219,12 @@ async def webhook(request: Request):
         log_signal(action, ticker, "blocked", "not_on_watchlist")
         print(f"WATCHLIST_REJECT symbol={ticker} action={action} src=tv")
         return {"status": "ignored", "reason": "not_on_watchlist", "ticker": ticker}
+
+    allowed, confirm_reason = confirm_allows(data)
+    if not allowed:
+        log_signal(action, ticker, "blocked", confirm_reason)
+        print(f"CONFIRM_REJECT symbol={ticker} action={action} reason={confirm_reason}")
+        return {"status": "ignored", "reason": confirm_reason, "ticker": ticker}
 
     if not is_regular_market_hours():
         log_signal(action, ticker, "blocked", "outside regular market hours")
