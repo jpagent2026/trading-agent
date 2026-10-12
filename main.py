@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import pytz
 
@@ -20,6 +20,10 @@ DEFAULT_WATCHLIST = ("AAPL", "MSFT", "NVDA")
 # === PHASE 2 STEP 2: signal log (log only, no new veto) ===
 SIGNAL_LOG = []
 SIGNAL_LOG_MAX = 200
+
+# === PHASE 2 STEP 4: shadow regime (log only, never vetoes) ===
+REGIME_CACHE = {"at": None, "note": None}
+REGIME_TTL_SECONDS = 1800
 
 
 def load_watchlist():
@@ -73,21 +77,102 @@ def now_et():
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
 
+def classify_regime(closes):
+    if len(closes) < 21:
+        return {"regime": "unknown", "risk_on": "unknown", "basis": "QQQ", "note": "not enough bars"}
+    last = closes[-1]
+    sma20 = sum(closes[-20:]) / 20
+    prior_sma20 = sum(closes[-21:-1]) / 20
+    week_ago = closes[-6]
+    five_day = (last - week_ago) / week_ago * 100 if week_ago else 0
+    window = closes[-10:]
+    span = (max(window) - min(window)) / last * 100 if last else 0
+    if span >= 6:
+        regime = "volatile"
+    elif last > sma20 and sma20 >= prior_sma20 and five_day > 0:
+        regime = "trend_up"
+    elif last < sma20 and sma20 <= prior_sma20 and five_day < 0:
+        regime = "trend_down"
+    else:
+        regime = "chop"
+    risk_on = "yes" if regime == "trend_up" else "no"
+    return {
+        "regime": regime,
+        "risk_on": risk_on,
+        "basis": "QQQ",
+        "last": round(last, 2),
+        "sma20": round(sma20, 2),
+        "five_day_pct": round(five_day, 2),
+        "ten_day_span_pct": round(span, 2),
+        "veto": False,
+    }
+
+
+def shadow_regime():
+    """Cheap QQQ note. Cached 30 minutes. Never blocks a trade."""
+    cached = REGIME_CACHE.get("note")
+    cached_at = REGIME_CACHE.get("at")
+    if cached and cached_at and (datetime.now(ET) - cached_at).total_seconds() < REGIME_TTL_SECONDS:
+        return cached
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        data_client = StockHistoricalDataClient(
+            os.getenv("ALPACA_API_KEY"),
+            os.getenv("ALPACA_SECRET_KEY"),
+        )
+        end = datetime.now(ET)
+        start = end - timedelta(days=50)
+        request = StockBarsRequest(
+            symbol_or_symbols="QQQ",
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+        )
+        bars = data_client.get_stock_bars(request)
+        rows = list(bars.data.get("QQQ", []))
+        closes = [float(b.close) for b in rows if getattr(b, "close", None) is not None]
+        note = classify_regime(closes)
+    except Exception as e:
+        note = {
+            "regime": "unknown",
+            "risk_on": "unknown",
+            "basis": "QQQ",
+            "veto": False,
+            "note": str(e)[:120],
+        }
+    note["as_of"] = now_et()
+    note["veto"] = False
+    REGIME_CACHE["at"] = datetime.now(ET)
+    REGIME_CACHE["note"] = note
+    print(
+        f"REGIME time={note['as_of']} regime={note.get('regime')} "
+        f"risk_on={note.get('risk_on')} basis=QQQ veto=false"
+    )
+    return note
+
+
 def log_signal(action, ticker, result, reason):
     """One line per webhook. result is allowed or blocked. Does not veto."""
+    regime = shadow_regime()
     row = {
         "time": now_et(),
         "ticker": ticker or "",
         "action": action or "",
         "result": result,
         "reason": reason,
+        "regime": regime.get("regime"),
+        "risk_on": regime.get("risk_on"),
     }
     SIGNAL_LOG.append(row)
     if len(SIGNAL_LOG) > SIGNAL_LOG_MAX:
         del SIGNAL_LOG[: len(SIGNAL_LOG) - SIGNAL_LOG_MAX]
     print(
         f"SIGNAL time={row['time']} ticker={row['ticker']} "
-        f"action={row['action']} result={row['result']} reason={row['reason']}"
+        f"action={row['action']} result={row['result']} reason={row['reason']} "
+        f"regime={row['regime']} risk_on={row['risk_on']}"
     )
     return row
 
@@ -191,6 +276,7 @@ def home():
             "trades_today": count_trades_today(client),
             "watchlist": sorted(WATCHLIST),
             "signals_kept": len(SIGNAL_LOG),
+            "regime": shadow_regime(),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -198,6 +284,10 @@ def home():
 @app.get("/signals")
 def signals():
     return {"count": len(SIGNAL_LOG), "signals": SIGNAL_LOG[-50:]}
+
+@app.get("/regime")
+def regime():
+    return shadow_regime()
 
 @app.post("/webhook")
 async def webhook(request: Request):
