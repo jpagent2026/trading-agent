@@ -25,6 +25,17 @@ SIGNAL_LOG_MAX = 200
 REGIME_CACHE = {"at": None, "note": None}
 REGIME_TTL_SECONDS = 1800
 
+# === PHASE 2 STEP 5: industry map (log only, never vetoes) ===
+# Hand-kept. No match defaults to neutral. Do not trade heartbeat buy-stops.
+INDUSTRY_FEED = "https://heartbeat-backtest-production.up.railway.app/industry_ranking.json"
+STOCK_INDUSTRY = {
+    "NVDA": "SMH",   # semiconductors
+    "MSFT": "IGV",   # software
+    # AAPL has no clean match in the 45 ETFs. Defaults to neutral.
+}
+INDUSTRY_CACHE = {"at": None, "payload": None}
+INDUSTRY_TTL_SECONDS = 6 * 3600
+
 
 def load_watchlist():
     raw = os.getenv("WATCHLIST", "")
@@ -50,10 +61,6 @@ def normalize_ticker(ticker):
 def on_watchlist(ticker):
     return ticker in WATCHLIST
 
-
-# === PHASE 2 STEP 3: optional confirm ===
-# Missing confirm = EMA9 path, still trades.
-# "confirm": false blocks. "confirm": true passes into the same risk rules.
 
 def confirm_allows(data):
     if "confirm" not in data:
@@ -109,7 +116,6 @@ def classify_regime(closes):
 
 
 def shadow_regime():
-    """Cheap QQQ note. Cached 30 minutes. Never blocks a trade."""
     cached = REGIME_CACHE.get("note")
     cached_at = REGIME_CACHE.get("at")
     if cached and cached_at and (datetime.now(ET) - cached_at).total_seconds() < REGIME_TTL_SECONDS:
@@ -154,9 +160,70 @@ def shadow_regime():
     return note
 
 
+def load_industry_feed():
+    cached = INDUSTRY_CACHE.get("payload")
+    cached_at = INDUSTRY_CACHE.get("at")
+    if cached and cached_at and (datetime.now(ET) - cached_at).total_seconds() < INDUSTRY_TTL_SECONDS:
+        return cached
+    try:
+        import httpx
+        response = httpx.get(INDUSTRY_FEED, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        payload = cached or {"as_of": None, "industries": [], "tiers": {}, "note": str(e)[:120]}
+    INDUSTRY_CACHE["at"] = datetime.now(ET)
+    INDUSTRY_CACHE["payload"] = payload
+    return payload
+
+
+def industry_note(ticker):
+    etf = STOCK_INDUSTRY.get((ticker or "").upper())
+    if not etf:
+        return {
+            "stock": ticker,
+            "etf": None,
+            "industry": None,
+            "tier": "neutral",
+            "ret_3m": None,
+            "would_skip": False,
+            "would_skip_soft": False,
+            "veto": False,
+            "note": "no industry match",
+        }
+    payload = load_industry_feed()
+    row = None
+    for item in payload.get("industries", []):
+        if str(item.get("ticker", "")).upper() == etf:
+            row = item
+            break
+    tier = (row or {}).get("tier") or payload.get("tiers", {}).get(etf) or "unknown"
+    ret_3m = (row or {}).get("ret_3m")
+    would_skip = tier == "laggard"
+    would_skip_soft = would_skip and isinstance(ret_3m, (int, float)) and ret_3m < 0
+    note = {
+        "stock": ticker,
+        "etf": etf,
+        "industry": (row or {}).get("industry"),
+        "tier": tier,
+        "rank": (row or {}).get("rank"),
+        "ret_3m": ret_3m,
+        "ret_6m": (row or {}).get("ret_6m"),
+        "as_of": payload.get("as_of"),
+        "would_skip": would_skip,
+        "would_skip_soft": would_skip_soft,
+        "veto": False,
+    }
+    print(
+        f"INDUSTRY stock={ticker} etf={etf} tier={tier} "
+        f"would_skip={str(would_skip).lower()} veto=false"
+    )
+    return note
+
+
 def log_signal(action, ticker, result, reason):
-    """One line per webhook. result is allowed or blocked. Does not veto."""
     regime = shadow_regime()
+    industry = industry_note(ticker)
     row = {
         "time": now_et(),
         "ticker": ticker or "",
@@ -165,6 +232,9 @@ def log_signal(action, ticker, result, reason):
         "reason": reason,
         "regime": regime.get("regime"),
         "risk_on": regime.get("risk_on"),
+        "industry_etf": industry.get("etf"),
+        "industry_tier": industry.get("tier"),
+        "would_skip": industry.get("would_skip"),
     }
     SIGNAL_LOG.append(row)
     if len(SIGNAL_LOG) > SIGNAL_LOG_MAX:
@@ -172,7 +242,9 @@ def log_signal(action, ticker, result, reason):
     print(
         f"SIGNAL time={row['time']} ticker={row['ticker']} "
         f"action={row['action']} result={row['result']} reason={row['reason']} "
-        f"regime={row['regime']} risk_on={row['risk_on']}"
+        f"regime={row['regime']} risk_on={row['risk_on']} "
+        f"industry={row['industry_etf']} tier={row['industry_tier']} "
+        f"would_skip={str(row['would_skip']).lower()}"
     )
     return row
 
@@ -277,6 +349,9 @@ def home():
             "watchlist": sorted(WATCHLIST),
             "signals_kept": len(SIGNAL_LOG),
             "regime": shadow_regime(),
+            "industry": {
+                name: industry_note(name) for name in sorted(WATCHLIST)
+            },
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -288,6 +363,15 @@ def signals():
 @app.get("/regime")
 def regime():
     return shadow_regime()
+
+@app.get("/industry")
+def industry():
+    payload = load_industry_feed()
+    return {
+        "as_of": payload.get("as_of"),
+        "veto": False,
+        "map": {name: industry_note(name) for name in sorted(WATCHLIST)},
+    }
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -368,7 +452,7 @@ async def webhook(request: Request):
             qty = TEST_QTY
             print(f"Using test quantity: {qty}")
 
-        else:  # sell
+        else:
             current_qty = get_position_qty(client, ticker)
             print(f"Current long position in {ticker}: {current_qty}")
             if current_qty <= 0:
