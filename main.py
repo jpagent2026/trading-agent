@@ -5,6 +5,10 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from datetime import datetime, timedelta
 import os
 import pytz
+import sqlite3
+from pathlib import Path
+import httpx
+import json
 
 app = FastAPI()
 
@@ -26,26 +30,159 @@ REGIME_CACHE = {"at": None, "note": None}
 REGIME_TTL_SECONDS = 1800
 
 # === PHASE 2 STEP 5: industry map (log only, never vetoes) ===
-# Hand-kept. No match defaults to neutral. Do not trade heartbeat buy-stops.
 INDUSTRY_FEED = "https://heartbeat-backtest-production.up.railway.app/industry_ranking.json"
 STOCK_INDUSTRY = {
-    "NVDA": "SMH",   # semiconductors
-    "MSFT": "IGV",   # software
-    # AAPL has no clean match in the 45 ETFs. Defaults to neutral.
+    "NVDA": "SMH",
+    "MSFT": "IGV",
 }
 INDUSTRY_CACHE = {"at": None, "payload": None}
 INDUSTRY_TTL_SECONDS = 6 * 3600
 
+# === Persistent decision log ===
+DB_PATH = Path("/data/agent200.db")
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT,
+                ticker TEXT,
+                action TEXT,
+                result TEXT,
+                reason TEXT,
+                regime TEXT,
+                risk_on TEXT,
+                industry_etf TEXT,
+                industry_tier TEXT,
+                would_skip INTEGER,
+                raw_json TEXT
+            )
+        """)
+        conn.commit()
+
+def persist_signal(row: dict):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO signals (
+                time, ticker, action, result, reason,
+                regime, risk_on, industry_etf, industry_tier, would_skip, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row.get("time"),
+            row.get("ticker"),
+            row.get("action"),
+            row.get("result"),
+            row.get("reason"),
+            row.get("regime"),
+            row.get("risk_on"),
+            row.get("industry_etf"),
+            row.get("industry_tier"),
+            1 if row.get("would_skip") else 0,
+            str(row),
+        ))
+        conn.commit()
+
+def get_recent_signals(limit: int = 50):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def get_latest_signal_for(ticker: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM signals WHERE ticker = ? ORDER BY id DESC LIMIT 1",
+            (ticker.upper(),)
+        ).fetchone()
+        return dict(row) if row else None
+
+def end_of_day_summary():
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE time LIKE ? ORDER BY id",
+            (f"{today}%",)
+        ).fetchall()
+    signals = [dict(r) for r in rows]
+    allowed = [s for s in signals if s["result"] == "allowed"]
+    blocked = [s for s in signals if s["result"] == "blocked"]
+    return {
+        "date": today,
+        "total_signals": len(signals),
+        "allowed": len(allowed),
+        "blocked": len(blocked),
+        "signals": signals[-30:],
+    }
+
+async def generate_memo(ticker: str, signal_row: dict) -> dict:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {
+            "ticker": ticker,
+            "thesis": "No ANTHROPIC_API_KEY set",
+            "risks": "—",
+            "confidence": 0.0,
+            "note": "second opinion only — no order impact",
+            "based_on_signal": signal_row.get("time"),
+        }
+    prompt = (
+        f"Second-opinion memo only. Do not recommend size or orders.\n"
+        f"Ticker: {ticker}\n"
+        f"Last signal: {signal_row.get('action')} {signal_row.get('result')} — {signal_row.get('reason')}\n"
+        f"Regime: {signal_row.get('regime')} risk_on={signal_row.get('risk_on')}\n"
+        f"Industry: {signal_row.get('industry_etf')} tier={signal_row.get('industry_tier')}\n"
+        f"Return only valid JSON with keys: thesis, risks, confidence (0.0-1.0), note.\n"
+        f"Example: {{\"thesis\": \"one sentence\", \"risks\": \"one sentence\", \"confidence\": 0.6, \"note\": \"second opinion only\"}}"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 300,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            text = resp.json()["content"][0]["text"]
+            parsed = json.loads(text)
+            parsed["ticker"] = ticker
+            parsed["based_on_signal"] = signal_row.get("time")
+            parsed["note"] = parsed.get("note", "second opinion only — no order impact")
+            return parsed
+    except Exception as e:
+        return {
+            "ticker": ticker,
+            "thesis": f"Error: {str(e)[:80]}",
+            "risks": "—",
+            "confidence": 0.0,
+            "note": "second opinion only — no order impact",
+            "based_on_signal": signal_row.get("time"),
+        }
+
+init_db()
 
 def load_watchlist():
     raw = os.getenv("WATCHLIST", "")
     parts = [p.strip().upper() for p in raw.replace(";", ",").split(",") if p.strip()]
     return set(parts) if parts else set(DEFAULT_WATCHLIST)
 
-
 WATCHLIST = load_watchlist()
 ET = pytz.timezone("America/New_York")
-
 
 def normalize_ticker(ticker):
     t = (ticker or "").strip().upper()
@@ -57,10 +194,8 @@ def normalize_ticker(ticker):
         t = t.split("-")[0]
     return t
 
-
 def on_watchlist(ticker):
     return ticker in WATCHLIST
-
 
 def confirm_allows(data):
     if "confirm" not in data:
@@ -79,10 +214,8 @@ def confirm_allows(data):
         return False, "confirm false"
     return False, "confirm invalid"
 
-
 def now_et():
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-
 
 def classify_regime(closes):
     if len(closes) < 21:
@@ -114,7 +247,6 @@ def classify_regime(closes):
         "veto": False,
     }
 
-
 def shadow_regime():
     cached = REGIME_CACHE.get("note")
     cached_at = REGIME_CACHE.get("at")
@@ -124,7 +256,6 @@ def shadow_regime():
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
-
         data_client = StockHistoricalDataClient(
             os.getenv("ALPACA_API_KEY"),
             os.getenv("ALPACA_SECRET_KEY"),
@@ -159,14 +290,12 @@ def shadow_regime():
     )
     return note
 
-
 def load_industry_feed():
     cached = INDUSTRY_CACHE.get("payload")
     cached_at = INDUSTRY_CACHE.get("at")
     if cached and cached_at and (datetime.now(ET) - cached_at).total_seconds() < INDUSTRY_TTL_SECONDS:
         return cached
     try:
-        import httpx
         response = httpx.get(INDUSTRY_FEED, timeout=15)
         response.raise_for_status()
         payload = response.json()
@@ -175,7 +304,6 @@ def load_industry_feed():
     INDUSTRY_CACHE["at"] = datetime.now(ET)
     INDUSTRY_CACHE["payload"] = payload
     return payload
-
 
 def industry_note(ticker):
     etf = STOCK_INDUSTRY.get((ticker or "").upper())
@@ -220,7 +348,6 @@ def industry_note(ticker):
     )
     return note
 
-
 def log_signal(action, ticker, result, reason):
     regime = shadow_regime()
     industry = industry_note(ticker)
@@ -246,8 +373,8 @@ def log_signal(action, ticker, result, reason):
         f"industry={row['industry_etf']} tier={row['industry_tier']} "
         f"would_skip={str(row['would_skip']).lower()}"
     )
+    persist_signal(row)
     return row
-
 
 def get_trading_client():
     api_key = os.getenv("ALPACA_API_KEY")
@@ -360,6 +487,104 @@ def home():
 def signals():
     return {"count": len(SIGNAL_LOG), "signals": SIGNAL_LOG[-50:]}
 
+@app.get("/signals/persistent")
+def signals_persistent(limit: int = 50):
+    return {"count": limit, "signals": get_recent_signals(limit)}
+
+@app.get("/summary/today")
+def summary_today():
+    return end_of_day_summary()
+
+@app.post("/memo")
+async def memo(request: Request):
+    data = await request.json()
+    ticker = normalize_ticker(data.get("ticker", ""))
+    if not ticker or not on_watchlist(ticker):
+        return {"status": "ignored", "reason": "not_on_watchlist_or_missing"}
+    signal_row = get_latest_signal_for(ticker)
+    if not signal_row:
+        return {"status": "no_signal", "ticker": ticker}
+    memo_result = await generate_memo(ticker, signal_row)
+    return {"status": "ok", "memo": memo_result}
+
+@app.post("/approve")
+async def approve(request: Request):
+    data = await request.json()
+    action = data.get("action", "").lower()
+    ticker = normalize_ticker(data.get("ticker", ""))
+    if action not in ["buy", "sell"]:
+        log_signal(action, ticker, "blocked", "approve: action must be buy or sell")
+        return {"status": "ignored", "message": "action must be buy or sell"}
+    if not ticker:
+        log_signal(action, ticker, "blocked", "approve: ticker required")
+        return {"status": "error", "message": "ticker required"}
+    if not on_watchlist(ticker):
+        log_signal(action, ticker, "blocked", "approve: not_on_watchlist")
+        return {"status": "ignored", "reason": "not_on_watchlist", "ticker": ticker}
+
+    if not is_regular_market_hours():
+        log_signal(action, ticker, "blocked", "approve: outside regular market hours")
+        return {"status": "ignored", "message": "Outside regular market hours"}
+
+    try:
+        client = get_trading_client()
+        can_trade, daily_change = check_daily_loss_limit(client)
+        if not can_trade:
+            reason = f"approve: daily loss limit {daily_change:.2f}%"
+            log_signal(action, ticker, "blocked", reason)
+            return {"status": "halted", "message": reason}
+
+        trades_today = count_trades_today(client)
+        if trades_today >= MAX_TRADES_PER_DAY:
+            log_signal(action, ticker, "blocked", f"approve: max trades per day ({MAX_TRADES_PER_DAY})")
+            return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
+
+        if has_pending_order(client, ticker):
+            log_signal(action, ticker, "blocked", "approve: pending order exists")
+            return {"status": "ignored", "message": f"Pending order exists for {ticker}"}
+
+        if action == "buy":
+            current_qty = get_position_qty(client, ticker)
+            if current_qty > 0:
+                log_signal(action, ticker, "blocked", "approve: already long")
+                return {"status": "ignored", "message": f"Already long {ticker}"}
+            if sold_ticker_today(client, ticker):
+                log_signal(action, ticker, "blocked", "approve: already sold today")
+                return {"status": "ignored", "message": f"Already sold {ticker} today"}
+            open_count = get_open_positions_count(client)
+            if open_count >= MAX_POSITIONS:
+                log_signal(action, ticker, "blocked", f"approve: max positions ({MAX_POSITIONS})")
+                return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
+            qty = TEST_QTY
+        else:
+            current_qty = get_position_qty(client, ticker)
+            if current_qty <= 0:
+                log_signal(action, ticker, "blocked", "approve: no long position")
+                return {"status": "ignored", "message": f"No long position in {ticker}"}
+            if bought_ticker_today(client, ticker):
+                log_signal(action, ticker, "blocked", "approve: bought today")
+                return {"status": "ignored", "message": f"Bought {ticker} today"}
+            qty = min(int(current_qty), TEST_QTY)
+
+        side = OrderSide.BUY if action == "buy" else OrderSide.SELL
+        order_data = MarketOrderRequest(
+            symbol=ticker,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY
+        )
+        order = client.submit_order(order_data)
+        log_signal(action, ticker, "allowed", f"approve paper {action} {qty} order {order.id}")
+        return {
+            "status": "success",
+            "message": f"Approved paper trade placed: {action} {qty} {ticker}",
+            "order_id": str(order.id),
+            "qty": qty
+        }
+    except Exception as e:
+        log_signal(action, ticker, "blocked", f"approve order failed {type(e).__name__}")
+        return {"status": "error", "message": str(e)}
+
 @app.get("/regime")
 def regime():
     return shadow_regime()
@@ -377,38 +602,30 @@ def industry():
 async def webhook(request: Request):
     data = await request.json()
     print("Received webhook:", data)
-
     action = data.get("action", "").lower()
     ticker = normalize_ticker(data.get("ticker", ""))
-
     if action not in ["buy", "sell"]:
         log_signal(action, ticker, "blocked", "action must be buy or sell")
         return {"status": "ignored", "message": "action must be buy or sell"}
-
     if not ticker:
         log_signal(action, ticker, "blocked", "ticker required")
         return {"status": "error", "message": "ticker required"}
-
     if not on_watchlist(ticker):
         log_signal(action, ticker, "blocked", "not_on_watchlist")
         print(f"WATCHLIST_REJECT symbol={ticker} action={action} src=tv")
         return {"status": "ignored", "reason": "not_on_watchlist", "ticker": ticker}
-
     allowed, confirm_reason = confirm_allows(data)
     if not allowed:
         log_signal(action, ticker, "blocked", confirm_reason)
         print(f"CONFIRM_REJECT symbol={ticker} action={action} reason={confirm_reason}")
         return {"status": "ignored", "reason": confirm_reason, "ticker": ticker}
-
     if not is_regular_market_hours():
         log_signal(action, ticker, "blocked", "outside regular market hours")
         print(f"Signal ignored - outside regular market hours: {action} {ticker}")
         return {"status": "ignored", "message": "Outside regular market hours"}
-
     try:
         client = get_trading_client()
         print("Trading client created successfully")
-
         can_trade, daily_change = check_daily_loss_limit(client)
         print(f"Daily change: {daily_change:.2f}%")
         if not can_trade:
@@ -416,19 +633,16 @@ async def webhook(request: Request):
             log_signal(action, ticker, "blocked", reason)
             print(f"Daily loss limit reached ({daily_change:.2f}%). Trading halted.")
             return {"status": "halted", "message": f"Daily loss limit reached ({daily_change:.2f}%)"}
-
         trades_today = count_trades_today(client)
         print(f"Trades today: {trades_today}")
         if trades_today >= MAX_TRADES_PER_DAY:
             log_signal(action, ticker, "blocked", f"max trades per day ({MAX_TRADES_PER_DAY})")
             print(f"Max trades per day ({MAX_TRADES_PER_DAY}) reached. Ignoring signal.")
             return {"status": "ignored", "message": f"Max trades per day ({MAX_TRADES_PER_DAY}) reached"}
-
         if has_pending_order(client, ticker):
             log_signal(action, ticker, "blocked", "pending order exists")
             print(f"Pending order already exists for {ticker}. Ignoring {action}.")
             return {"status": "ignored", "message": f"Pending order exists for {ticker}"}
-
         if action == "buy":
             current_qty = get_position_qty(client, ticker)
             print(f"Current long position in {ticker}: {current_qty}")
@@ -436,22 +650,18 @@ async def webhook(request: Request):
                 log_signal(action, ticker, "blocked", "already long")
                 print(f"Already long {ticker}. Ignoring add-on buy.")
                 return {"status": "ignored", "message": f"Already long {ticker}"}
-
             if sold_ticker_today(client, ticker):
                 log_signal(action, ticker, "blocked", "already sold today")
                 print(f"Already sold {ticker} today. Ignoring same-day re-buy.")
                 return {"status": "ignored", "message": f"Already sold {ticker} today"}
-
             open_count = get_open_positions_count(client)
             print(f"Open positions: {open_count}")
             if open_count >= MAX_POSITIONS:
                 log_signal(action, ticker, "blocked", f"max positions ({MAX_POSITIONS})")
                 print(f"Max positions ({MAX_POSITIONS}) reached. Ignoring buy.")
                 return {"status": "ignored", "message": f"Max positions ({MAX_POSITIONS}) reached"}
-
             qty = TEST_QTY
             print(f"Using test quantity: {qty}")
-
         else:
             current_qty = get_position_qty(client, ticker)
             print(f"Current long position in {ticker}: {current_qty}")
@@ -459,19 +669,16 @@ async def webhook(request: Request):
                 log_signal(action, ticker, "blocked", "no long position")
                 print(f"No long position in {ticker}. Ignoring sell to avoid shorting.")
                 return {"status": "ignored", "message": f"No long position in {ticker}"}
-
             if bought_ticker_today(client, ticker):
                 log_signal(action, ticker, "blocked", "bought today")
                 print(f"Bought {ticker} today. Ignoring same-day sell.")
                 return {"status": "ignored", "message": f"Bought {ticker} today. Hold until next session."}
-
             try:
                 requested_qty = int(float(data.get("qty", current_qty)))
             except Exception:
                 requested_qty = int(current_qty)
             qty = min(requested_qty, int(current_qty))
             print(f"Selling {qty} shares of {ticker}")
-
         print(f"Submitting order: {action} {qty} {ticker}")
         side = OrderSide.BUY if action == "buy" else OrderSide.SELL
         order_data = MarketOrderRequest(
@@ -480,18 +687,15 @@ async def webhook(request: Request):
             side=side,
             time_in_force=TimeInForce.DAY
         )
-
         order = client.submit_order(order_data)
         print(f"PAPER TRADE PLACED: {action.upper()} {qty} {ticker} | Order ID: {order.id}")
         log_signal(action, ticker, "allowed", f"paper {action} {qty} order {order.id}")
-
         return {
             "status": "success",
             "message": f"Paper trade placed: {action} {qty} {ticker}",
             "order_id": str(order.id),
             "qty": qty
         }
-
     except Exception as e:
         print(f"ORDER FAILED - FULL ERROR: {type(e).__name__}: {e}")
         import traceback
