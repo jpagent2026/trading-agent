@@ -436,26 +436,66 @@ def sold_ticker_today(client, ticker):
 def bought_ticker_today(client, ticker):
     return ticker_side_today(client, ticker, "buy")
 
+def order_type_str(order):
+    return str(getattr(getattr(order, "order_type", ""), "value", getattr(order, "order_type", ""))).lower()
+
+def is_stop_order(order):
+    return "stop" in order_type_str(order)
+
+# Statuses in which a resting stop (e.g. the stop leg of an OTO entry) is still live.
+LIVE_STOP_STATUSES = ("new", "held", "accepted", "pending_new", "partially_filled")
+
 def has_pending_order(client, ticker):
     for o in get_today_orders(client):
         symbol = str(getattr(o, "symbol", "")).upper()
-        if symbol == ticker.upper() and order_status_str(o) in ["new", "accepted", "pending_new", "partially_filled"]:
+        if symbol != ticker.upper():
+            continue
+        status = order_status_str(o)
+        # A resting protective stop leg is not a "pending order"; exits cancel it first.
+        if is_stop_order(o) and status in ("new", "held"):
+            continue
+        if status in ["new", "accepted", "pending_new", "partially_filled"]:
             return True
     return False
 
+def _flatten_orders(orders):
+    """Yield each order and, recursively, any nested legs."""
+    for o in orders or []:
+        yield o
+        legs = getattr(o, "legs", None) or []
+        if legs:
+            yield from _flatten_orders(legs)
+
 def cancel_open_stops(client, ticker: str):
-    """Cancel open stop orders for a ticker before exiting."""
-    try:
-        orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker]))
-        for o in orders:
-            otype = str(getattr(o, "order_type", "")).lower()
-            if "stop" in otype:
-                try:
-                    client.cancel_order_by_id(o.id)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    """Cancel live stop orders for a ticker (including held OTO/bracket stop legs) before exiting."""
+    queries = [
+        # Currently open orders (any age, e.g. GTC stops from earlier days), legs listed flat.
+        GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker]),
+        # Same, rolled up under parents, so held child legs are visible via .legs.
+        GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker], nested=True),
+        # All of today's orders, filtered locally, in case held legs are omitted from the open query.
+        GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=[ticker], after=get_today_start(), nested=True),
+    ]
+    seen = set()
+    for req in queries:
+        try:
+            orders = client.get_orders(req)
+        except Exception:
+            continue
+        for o in _flatten_orders(orders):
+            oid = str(getattr(o, "id", ""))
+            if not oid or oid in seen:
+                continue
+            symbol = str(getattr(o, "symbol", ticker) or ticker).upper()
+            if symbol != ticker.upper():
+                continue
+            if not is_stop_order(o) or order_status_str(o) not in LIVE_STOP_STATUSES:
+                continue
+            seen.add(oid)
+            try:
+                client.cancel_order_by_id(o.id)
+            except Exception:
+                pass
 
 def is_shortable(client, ticker: str) -> bool:
     try:
@@ -649,15 +689,15 @@ async def approve(request: Request):
                 qty = TEST_QTY
 
             side = OrderSide.BUY
-            # Bracket / stop if stop provided
+            # OTO entry with a GTC protective stop if stop provided
             if stop_raw is not None:
                 order_data = MarketOrderRequest(
                     symbol=ticker,
                     qty=qty,
                     side=side,
-                    time_in_force=TimeInForce.DAY,
-                    order_class=OrderClass.BRACKET,
-                    stop_loss=StopLossRequest(stop_price=float(stop_raw)),
+                    time_in_force=TimeInForce.GTC,
+                    order_class=OrderClass.OTO,
+                    stop_loss=StopLossRequest(stop_price=round(stop, 2)),
                 )
             else:
                 order_data = MarketOrderRequest(
@@ -715,9 +755,9 @@ async def approve(request: Request):
                 symbol=ticker,
                 qty=qty,
                 side=side,
-                time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                stop_loss=StopLossRequest(stop_price=stop),
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.OTO,
+                stop_loss=StopLossRequest(stop_price=round(stop, 2)),
             )
 
         # ---------- SELL (close long) ----------
