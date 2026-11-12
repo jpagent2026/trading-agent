@@ -141,6 +141,45 @@ long/short were "over half" of 2025 trades and the main setup in 2025–26 (spec
 at the close of the first 1-minute bar that takes out the previous bar's high (up to ~1 minute late). The planned
 entry used for sizing is that bar's close.
 
+## Stop enforcement (not a Luk judgment call: HK has no discretion to hold through a stop)
+
+**E1. A stop that can't be placed becomes a market exit.** Every stop placement (OTO leg found rejected/cancelled
+when the entry fills, re-place after a 15% trim or an earnings half-sell, the 90-day GTC refresh, and re-placing a
+stop that is no longer live) first reads the latest price (SIP latest trade, then the broker position's
+`current_price`, then the last streamed bar). If price <= stop (long) or >= stop (short stock), no stop is sent; the
+whole remaining position is market-exited (`reason: pre_check`). If Alpaca rejects the stop with a
+"through the market" error, or any error while price is through the stop, the same exit is sent
+(`reason: broker_reject`). Other rejections are logged as before. The entry OTO stop can't be through the market at
+submission (the stop is chosen below the same live price used as the entry); if Alpaca refused the OTO, nothing was
+bought, so there is nothing to flatten.
+
+**E2. Order type and hours.** The exit is a market DAY order for (broker position qty - qty already in working exit
+orders). Outside regular hours Alpaca accepts it and queues it for the next open (documented Alpaca behaviour for DAY
+orders). If Alpaca refuses it outside regular hours, the exit is written to `pending_exit` and the 9:30:30 open job
+sends it. In regular hours a refused exit is recorded as `failed` and retried by the periodic check a minute later.
+
+**E3. No double submits.** Before sending, HK checks: a `pending_exit` already queued for the open job (counted until
+9:31 ET; after that it is treated as stale), the trade's `exit_order_id` still working or filled, and any working
+non-stop exit-side order at Alpaca for the symbol (its unfilled qty is subtracted). Working orders are read before
+the position, so a fill in between can only make HK under-sell (fixed next cycle), never sell into a short. The open
+job now uses the same net-quantity flatten.
+
+**E4. Periodic check.** Every scheduler cycle (~10 s) from 9:30 to 16:00 ET on trading days, once at process start
+(any time of day, labelled `startup`) and on the first cycle after 9:30 (labelled `open`): every open position whose
+latest price is through its ledger stop and has no exit working is market-exited (`reason: periodic`). At most one
+attempt per trade per minute. If Alpaca still holds a live, un-triggered stop that is also through the price, HK
+leaves it to the broker outside regular hours (Alpaca triggers it at the open) and for 60 s of regular-hours time;
+after that it cancels the stop and sends the market exit.
+
+**E5. Shorts.** Short stock positions get the mirror rule (price >= stop -> market buy to cover). Inverse-ETF
+"shorts" are long positions and use the long rule.
+
+**E6. Monitoring.** Each event is logged (`STOP BREACH ...` warning), written to the events table, and stored in the
+`stop_breach_exits` table, shown read-only in `GET /status` as `stop_breach_exits` (symbol, qty, stop,
+trigger_price, reason, order_id, time, status, plus trade_id, direction, context, price_source, error). Status is
+`submitted`, `already_pending`, `queued_for_open`, `failed`, or `filled` once the trade closes. Luk's entry, sizing,
+trim, trail, earnings and pause rules are unchanged.
+
 ## Known limitations
 
 - Paper fills don't simulate slippage, queue position or impact (spec §8b.7). With tight 1–2% stops, paper results

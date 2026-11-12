@@ -120,8 +120,13 @@ def create_app(runtime: Optional[Runtime] = None, start_engine: bool = True) -> 
             d = rt.ledger.latest_watchlist_date()
             out["watchlist"] = {"session": d, "size": len(rt.ledger.load_watchlist(d)) if d else 0}
             out["recent_events"] = rt.ledger.events(10)
+            out["stop_breach_exits"] = [
+                {k: r.get(k) for k in ("symbol", "qty", "stop", "trigger_price", "reason", "order_id", "time", "status",
+                                       "trade_id", "direction", "context", "price_source", "error")}
+                for r in rt.ledger.stop_breach_exits(50)]
         if rt.scheduler is not None:
             out["jobs_last_run"] = rt.scheduler.last_runs
+            out["last_stop_check"] = rt.scheduler.last_stop_check
         if rt.engine is not None:
             out["earnings_calendar_ok"] = rt.engine.earnings_ok
         return out
