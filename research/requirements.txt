@@ -1,0 +1,7 @@
+# Strategy research harness only (not used by Agent 200 or HK Connection deploys).
+alpaca-py>=0.40   # market data client only (alpaca.data); research code never imports alpaca.trading
+pandas>=2.2
+numpy>=1.26
+pyarrow>=15       # Parquet cache (falls back to CSV if missing)
+matplotlib>=3.8   # equity-curve PNG in CANDIDATE reports
+pytest>=8
