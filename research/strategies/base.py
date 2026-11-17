@@ -98,3 +98,95 @@ def make_signals(index, side, stop, target_r, max_hold=0) -> pd.DataFrame:
     df["side"] = df["side"].astype(int)
     df["max_hold"] = df["max_hold"].astype(int)
     return df
+
+
+def bar_minutes(bars: pd.DataFrame) -> int:
+    """Bar length in minutes, inferred from the index (bars never span sessions)."""
+    if len(bars) < 2:
+        return 1
+    d = np.diff(bars.index.asi8)
+    d = d[d > 0]
+    return max(int(round(np.median(d) / 6e10)), 1) if len(d) else 1
+
+
+class DayGrid:
+    """The first `ncols` bars of every session laid out as [days x columns] matrices.
+
+    Column c holds the bar that STARTS at 09:30 + c * bar_minutes (NaN / -1 where a bar is
+    missing). Strategies written as small state machines walk the columns left to right with
+    numpy operations over all days at once, so every value in column c only uses columns <= c
+    (causal by construction) and a 5-minute, 10-year, 20-symbol run stays fast.
+    """
+
+    def __init__(self, bars: pd.DataFrame, ncols: int):
+        idx = bars.index
+        tf = bar_minutes(bars)
+        self.tf, self.ncols = tf, ncols
+        dates = pd.DatetimeIndex(idx.date)
+        codes, uniq = pd.factorize(dates, sort=True)
+        minute = (idx.hour * 60 + idx.minute) - (9 * 60 + 30)
+        col = np.asarray(minute) // tf
+        ok = (np.asarray(minute) >= 0) & (col < ncols)
+        D = len(uniq)
+        self.days = uniq
+        self.pos = np.full((D, ncols), -1, np.int64)
+        self.pos[codes[ok], col[ok]] = np.nonzero(ok)[0]
+        have = self.pos >= 0
+        self.have = have
+        safe = np.where(have, self.pos, 0)
+        for name in ("open", "high", "low", "close"):
+            v = bars[name].to_numpy(float)[safe]
+            setattr(self, name[0].upper(), np.where(have, v, np.nan))
+        self.index = idx
+
+    def emit(self, side, stop, target_r=np.nan, entry_px=None, be_after_r=np.nan, trail_r=np.nan,
+             max_hold=0) -> pd.DataFrame:
+        """Signal frame from [days x cols] matrices (side 0 = no signal). Row time = the bar in column c."""
+        side = np.asarray(side)
+        sel = (side != 0) & self.have & np.isfinite(stop)
+        d, c = np.nonzero(sel)
+        pos = self.pos[d, c]
+        order = np.argsort(pos, kind="stable")
+        d, c, pos = d[order], c[order], pos[order]
+
+        def pick(x, default=np.nan):
+            a = np.asarray(x, float)
+            return a[d, c] if a.ndim == 2 else np.full(len(d), float(a) if np.ndim(a) == 0 else default)
+
+        out = pd.DataFrame({
+            "side": side[d, c].astype(int), "stop": np.asarray(stop, float)[d, c],
+            "target_r": pick(target_r), "max_hold": int(max_hold),
+            "be_after_r": pick(be_after_r), "trail_r": pick(trail_r),
+            "entry_px": pick(np.nan if entry_px is None else entry_px)}, index=self.index[pos])
+        if entry_px is None:
+            out = out.drop(columns="entry_px")
+        return out
+
+
+def first_per_day(side: np.ndarray) -> np.ndarray:
+    """Keep only the first non-zero signal of each day (row)."""
+    nz = side != 0
+    first = nz & (np.cumsum(nz, axis=1) == 1)
+    return np.where(first, side, 0)
+
+
+_MEMO: dict = {}
+
+
+def memo(bars: pd.DataFrame, key, fn):
+    """Cache a parameter-independent feature of one bars frame (the grid search re-runs a
+    strategy on the same bars hundreds of times). The frame itself is kept in the entry so a
+    recycled id() can never hand back another frame's data."""
+    k = (id(bars), key)
+    hit = _MEMO.get(k)
+    if hit is not None and hit[0] is bars:
+        return hit[1]
+    if len(_MEMO) > 600:
+        _MEMO.clear()
+    v = fn()
+    _MEMO[k] = (bars, v)
+    return v
+
+
+def day_grid(bars: pd.DataFrame, ncols: int) -> DayGrid:
+    return memo(bars, ("grid", ncols), lambda: DayGrid(bars, ncols))

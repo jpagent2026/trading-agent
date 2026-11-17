@@ -8,6 +8,16 @@ Rules
     time exit (max_hold bars, exit at that bar's close) and end-of-day flatten (exit at
     the session's last close). Stop and target in the same bar -> stop (conservative).
     A bar that opens beyond the stop fills at the open (gap), not at the stop.
+  * Optional signal columns (all default to "off", so older strategies behave exactly as before):
+      entry_px    stop-entry (buy-stop / sell-stop) that triggers INSIDE the signal bar: the
+                  signal row is the bar in which price traded through entry_px, the fill is
+                  max(open, entry_px) for longs / min(open, entry_px) for shorts (a gap
+                  fills at the open), and stop/target checks start on that same bar (stop
+                  wins ties, so it is conservative).
+      be_after_r  once a bar has reached +be_after_r x R of profit, the stop moves to the
+                  entry price from the NEXT bar on (never inside the bar that triggered it).
+      trail_r     once +trail_r x R has been reached, the stop trails trail_r x R behind the
+                  best price of the PREVIOUS bars (ratchets only, from the next bar on).
   * One position per symbol at a time; signals while in a trade are ignored.
   * Sizing: fixed fractional risk, shares = floor(equity * risk_frac / risk_per_share),
     capped by max_leverage. R = net P&L / (shares * risk_per_share).
@@ -56,7 +66,9 @@ class BarArrays:
 
 def simulate_batch(arr: BarArrays, j: np.ndarray, side: np.ndarray, stop: np.ndarray,
                    target_r: np.ndarray, max_hold: np.ndarray, cost: CostModel,
-                   cfg: EngineConfig, stop_from_fill: np.ndarray | None = None) -> pd.DataFrame:
+                   cfg: EngineConfig, stop_from_fill: np.ndarray | None = None,
+                   be_r: np.ndarray | None = None, trail_r: np.ndarray | None = None,
+                   entry_px: np.ndarray | None = None) -> pd.DataFrame:
     """Simulate independent trades entering at the open of bar j.
 
     stop: absolute stop prices; or pass stop_from_fill (fraction of the entry fill) instead.
@@ -73,6 +85,12 @@ def simulate_batch(arr: BarArrays, j: np.ndarray, side: np.ndarray, stop: np.nda
     ok = (j >= 0) & (j < n)
     jc = np.clip(j, 0, max(n - 1, 0))
     entry_raw = arr.open[jc]
+    if entry_px is not None:
+        ep = np.asarray(entry_px, float)
+        entry_raw = np.where(np.isfinite(ep), np.where(side > 0, np.maximum(entry_raw, ep), np.minimum(entry_raw, ep)),
+                             entry_raw)
+    be_r = np.full(m, np.nan) if be_r is None else np.asarray(be_r, float)
+    trail_r = np.full(m, np.nan) if trail_r is None else np.asarray(trail_r, float)
     entry_fill = entry_raw * (1 + side * cost.side_bps / 1e4)
     if stop_from_fill is not None:
         stop = entry_fill * (1 - side * np.asarray(stop_from_fill, float))
@@ -94,8 +112,20 @@ def simulate_batch(arr: BarArrays, j: np.ndarray, side: np.ndarray, stop: np.nda
     valid &= (max_hold[:, None] <= 0) | (k[None, :] < max_hold[:, None])
     lo, hi, op, cl = arr.low[idxc], arr.high[idxc], arr.open[idxc], arr.close[idxc]
     lng = (side > 0)[:, None]
-    st = stop[:, None]
+    st = np.repeat(stop[:, None], H, axis=1)
     tg = target[:, None]
+    if np.isfinite(be_r).any() or np.isfinite(trail_r).any():
+        sd = side[:, None].astype(float)
+        best = np.where(lng, np.where(valid, hi, -np.inf), np.where(valid, lo, np.inf))
+        best = np.where(lng, np.maximum.accumulate(best, axis=1), np.minimum.accumulate(best, axis=1))
+        best_prev = np.concatenate([entry_raw[:, None], best[:, :-1]], axis=1)  # previous bars only
+        with np.errstate(invalid="ignore", divide="ignore"):
+            prog = sd * (best_prev - entry_fill[:, None]) / risk[:, None]
+            be_on = np.isfinite(be_r)[:, None] & (prog >= be_r[:, None])
+            tr_on = np.isfinite(trail_r)[:, None] & (prog >= trail_r[:, None])
+            trail_px = best_prev - sd * trail_r[:, None] * risk[:, None]
+        st = np.where(be_on, np.where(lng, np.maximum(st, entry_fill[:, None]), np.minimum(st, entry_fill[:, None])), st)
+        st = np.where(tr_on, np.where(lng, np.maximum(st, trail_px), np.minimum(st, trail_px)), st)
     stop_hit = np.where(lng, lo <= st, hi >= st) & valid
     with np.errstate(invalid="ignore"):
         tgt_hit = np.where(lng, hi >= tg, lo <= tg) & valid & np.isfinite(tg)
@@ -109,7 +139,8 @@ def simulate_batch(arr: BarArrays, j: np.ndarray, side: np.ndarray, stop: np.nda
     o = op[rows, exit_k]
     is_stop = (first_stop <= first_tgt) & (first_stop <= last_valid)
     is_tgt = ~is_stop & (first_tgt <= last_valid)
-    stop_px = np.where(side > 0, np.minimum(o, stop), np.maximum(o, stop))
+    stop_at_exit = st[rows, exit_k]
+    stop_px = np.where(side > 0, np.minimum(o, stop_at_exit), np.maximum(o, stop_at_exit))
     tgt_px = np.where(side > 0, np.maximum(o, target), np.minimum(o, target))
     exit_raw = np.where(is_stop, stop_px, np.where(is_tgt, tgt_px, cl[rows, exit_k]))
     reason = np.where(is_stop, "stop", np.where(is_tgt, "target",
@@ -141,7 +172,7 @@ def simulate_batch(arr: BarArrays, j: np.ndarray, side: np.ndarray, stop: np.nda
         "entry_time": entry_ts, "exit_time": exit_ts,
         "entry_raw": entry_raw, "entry": entry_fill, "exit_raw": exit_raw, "exit": exit_fill,
         "stop": stop, "target": target, "risk_ps": risk, "stop_frac": risk / entry_fill,
-        "target_r": target_r, "max_hold": max_hold, "shares": shares, "fees": fees,
+        "target_r": target_r, "max_hold": max_hold, "be_r": be_r, "trail_r": trail_r, "shares": shares, "fees": fees,
         "pnl": pnl, "r_gross": r_gross, "r_net": r_net, "bars_held": exit_k + 1,
         "exit_reason": reason,
     })
@@ -157,17 +188,21 @@ def run_signals(symbol: str, bars: pd.DataFrame, signals: pd.DataFrame, cost: Co
     pos = arr.index.get_indexer(sig.index)
     keep = pos >= 0
     sig, pos = sig[keep], pos[keep]
-    j = pos + 1
+    ep = sig["entry_px"].to_numpy(float) if "entry_px" in sig else np.full(len(sig), np.nan)
+    j = pos + np.where(np.isfinite(ep), 0, 1)   # stop-entries fill inside the signal bar itself
     inb = j < arr.n
-    sig, pos, j = sig[inb], pos[inb], j[inb]
+    sig, pos, j, ep = sig[inb], pos[inb], j[inb], ep[inb]
     if cfg.eod_flatten:
         same = arr.session[j] == arr.session[pos]
-        sig, pos, j = sig[same], pos[same], j[same]
+        sig, pos, j, ep = sig[same], pos[same], j[same], ep[same]
     if len(j) == 0:
         return _empty_trades()
     tr = sig["target_r"].to_numpy(float) if "target_r" in sig else np.full(len(j), np.nan)
     mh = sig["max_hold"].fillna(0).to_numpy(np.int64) if "max_hold" in sig else np.zeros(len(j), np.int64)
-    res = simulate_batch(arr, j, sig["side"].to_numpy(np.int64), sig["stop"].to_numpy(float), tr, mh, cost, cfg)
+    be = sig["be_after_r"].to_numpy(float) if "be_after_r" in sig else None
+    trl = sig["trail_r"].to_numpy(float) if "trail_r" in sig else None
+    res = simulate_batch(arr, j, sig["side"].to_numpy(np.int64), sig["stop"].to_numpy(float), tr, mh, cost, cfg,
+                         be_r=be, trail_r=trl, entry_px=ep)
     res["signal_time"] = pd.Series(sig.index, index=res.index)
     res = res[res["ok"].to_numpy()]
     # one position at a time + optional cap per day (sequential, cheap: per signal not per bar)
@@ -191,7 +226,7 @@ def run_signals(symbol: str, bars: pd.DataFrame, signals: pd.DataFrame, cost: Co
 
 def _empty_trades() -> pd.DataFrame:
     cols = ["symbol", "entry_idx", "exit_idx", "side", "entry_time", "exit_time", "entry_raw", "entry",
-            "exit_raw", "exit", "stop", "target", "risk_ps", "stop_frac", "target_r", "max_hold", "shares",
+            "exit_raw", "exit", "stop", "target", "risk_ps", "stop_frac", "target_r", "max_hold", "be_r", "trail_r", "shares",
             "fees", "pnl", "r_gross", "r_net", "bars_held", "exit_reason", "signal_time"]
     return pd.DataFrame(columns=cols)
 

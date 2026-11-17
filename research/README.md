@@ -52,7 +52,7 @@ python -m research.data_check                    # what the free data really has
 python -m research.run_research --synthetic      # dry run on fake data (no network, no ledger)
 python -m research.run_research                  # all ideas, default universe, 2016 -> now
 python -m research.run_research --strategy orb --symbols SPY QQQ
-python -m research.run_research --monthly-note   # "2026-12: tested 3, passed 0"
+python -m research.run_research --monthly-note   # "2026-12: tested 4, passed 0"
 python -m pytest research -q
 ```
 
@@ -61,7 +61,7 @@ Output is one line per idea plus `tested N, passed K`. Each verdict is appended 
 markdown report with an equity-curve PNG in `research/results/reports/`.
 
 Data is cached as Parquet under `/workspace/research-data` (outside the repo; change with
-`RESEARCH_DATA_DIR` or `--data-dir`). The first full pull of 20 symbols x ~11 years of
+`RESEARCH_DATA_DIR` or `--data-dir`). The first full pull of 21 symbols x ~11 years of
 1-minute bars takes a while (thousands of requests within the free plan's rate limit) and
 roughly 1-2 GB of disk; later runs read the cache.
 
@@ -73,9 +73,9 @@ roughly 1-2 GB of disk; later runs read the cache.
 | `data.py` | download 1-min SIP bars (`adjustment='all'`), monthly Parquet cache, RTH filter (DST-aware, 13:00 half-days), 5/15/60-min + daily resampling |
 | `data_check.py` | checks history depth, gaps, bars per day, half-days, SIP access, splits, delisted names; writes `DATA_CHECK.md` |
 | `costs.py` | slippage + half-spread per side, SEC/TAF sell fees, short borrow |
-| `backtest.py` | engine: signal on close, fill next open, stop / target / time / end-of-day exits, fixed-fractional sizing |
+| `backtest.py` | engine: signal on close, fill next open (or inside the bar for a buy-stop / sell-stop entry), stop / target / time / end-of-day exits, optional breakeven and trailing stops, fixed-fractional sizing |
 | `validation.py` | the pass bar above |
-| `strategies/` | ORB, Harry Sharp-style bias + wick, 9 EMA / 20 SMA pullback. Rules and sources: `RULES.md` |
+| `strategies/` | ORB, Harry Sharp-style bias + structure + wick, 9 EMA / 20 SMA / 200 SMA pullback (5-min and a timeframe-rotation variant). Rules follow the user's handout of 2026-11-17: `RULES.md` |
 | `run_research.py` | the CLI |
 | `ledger.py`, `report.py` | ledger and CANDIDATE reports |
 

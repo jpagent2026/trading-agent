@@ -220,13 +220,15 @@ def random_benchmark(trades: pd.DataFrame, data: dict, arrays: dict, folds: list
         if len(cand) == 0:
             continue
         plans.append((sym, arr, cand, g["side"].to_numpy(np.int64), g["stop_frac"].to_numpy(float),
-                      g["target_r"].to_numpy(float), g["max_hold"].to_numpy(np.int64)))
+                      g["target_r"].to_numpy(float), g["max_hold"].to_numpy(np.int64),
+                      g["be_r"].to_numpy(float), g["trail_r"].to_numpy(float)))
     means = np.empty(runs)
     for k in range(runs):
         tot, cnt = 0.0, 0
-        for sym, arr, cand, side, sf, tr, mh in plans:
+        for sym, arr, cand, side, sf, tr, mh, be, trl in plans:
             j = rng.choice(cand, size=len(side), replace=True)
-            res = bt.simulate_batch(arr, j, side, None, tr, mh, cost_for(sym), cfg, stop_from_fill=sf)
+            res = bt.simulate_batch(arr, j, side, None, tr, mh, cost_for(sym), cfg, stop_from_fill=sf,
+                                    be_r=be, trail_r=trl)
             r = res.loc[res["ok"], "r_net"].to_numpy(float)
             tot += r.sum()
             cnt += len(r)

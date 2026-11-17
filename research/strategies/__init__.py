@@ -1,8 +1,8 @@
-from .ema_pullback import EmaSmaPullback
+from .ema_pullback import EmaSmaPullback, EmaSmaRotation
 from .harry_sharp import HarrySharpWick
 from .orb import ORB
 
-REGISTRY = {s.name: s for s in (ORB, HarrySharpWick, EmaSmaPullback)}
+REGISTRY = {s.name: s for s in (ORB, HarrySharpWick, EmaSmaPullback, EmaSmaRotation)}
 
 
 def get(name: str):

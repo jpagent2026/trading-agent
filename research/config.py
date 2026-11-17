@@ -30,7 +30,9 @@ FEED = "sip"
 ADJUSTMENT = "all"  # splits + dividends
 
 # Default universe: liquid ETFs plus large caps (all "liquid" cost tier).
-DEFAULT_ETFS = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLY"]
+# QQQ / SPY / DIA / GLD are the stand-ins for the handout's futures (NQ / ES / YM / GC), which
+# Alpaca's free stock data does not cover. NVDA, AAPL and TSLA are the handout's stock symbols.
+DEFAULT_ETFS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "XLF", "XLK", "XLE", "XLV", "XLI", "XLY"]
 DEFAULT_LARGE_CAPS = ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "JPM", "XOM", "UNH"]
 DEFAULT_UNIVERSE = DEFAULT_ETFS + DEFAULT_LARGE_CAPS
 
