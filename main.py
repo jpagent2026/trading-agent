@@ -1,5 +1,6 @@
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
@@ -38,7 +39,10 @@ DEFAULT_WATCHLIST = ("AAPL", "MSFT", "NVDA")
 SIGNAL_LOG = []
 SIGNAL_LOG_MAX = 200
 
-# === PHASE 2 STEP 4: shadow regime (log only, never vetoes longs) ===
+# === PHASE 2 STEP 4: market regime filter ===
+# A RISK-OFF reading (risk_on == "no") sets veto=True, and /approve then refuses NEW LONG BUYS.
+# Sells, covers, and broker stop/target exits are never blocked. If the reading cannot be
+# computed (regime "unknown"), veto stays False and buys are allowed (fail-open), with a log line.
 REGIME_CACHE = {"at": None, "note": None}
 REGIME_TTL_SECONDS = 1800
 
@@ -245,7 +249,8 @@ def classify_regime(closes):
         "sma20": round(sma20, 2),
         "five_day_pct": round(five_day, 2),
         "ten_day_span_pct": round(span, 2),
-        "veto": False,
+        # Veto = the filter's own RISK-OFF reading (anything other than trend_up). No new thresholds.
+        "veto": risk_on == "no",
     }
 
 def shadow_regime():
@@ -517,6 +522,28 @@ def compute_qty(equity: float, entry: float, stop: float, risk_pct: float) -> in
     qty = max(0, min(raw, max_shares))
     return int(qty)
 
+def regime_veto_refusal(action: str, ticker: str, reading: dict):
+    """409 response for a buy refused by the regime filter. Logged like every other block."""
+    regime_name = reading.get("regime")
+    message = (
+        f"Buy refused: the market regime filter reads RISK-OFF "
+        f"(QQQ regime '{regime_name}', risk_on='{reading.get('risk_on')}'), "
+        f"so new long buys are blocked. Sells, covers, and stop/target exits are not affected."
+    )
+    log_signal(action, ticker, "blocked", f"approve: regime_veto regime={regime_name} risk_on={reading.get('risk_on')}")
+    return JSONResponse(
+        status_code=409,
+        content={
+            "status": "refused",
+            "reason": "regime_veto",
+            "action": action,
+            "ticker": ticker,
+            "veto": True,
+            "regime": dict(reading),
+            "message": message,
+        },
+    )
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -645,6 +672,16 @@ async def approve(request: Request):
 
         # ---------- BUY ----------
         if action == "buy":
+            # Regime veto: a RISK-OFF reading refuses new long buys (exits are handled below, unaffected).
+            regime_reading = shadow_regime()
+            if regime_reading.get("veto") is True:
+                return regime_veto_refusal(action, ticker, regime_reading)
+            if regime_reading.get("risk_on") not in ("yes", "no"):
+                print(
+                    f"REGIME_UNAVAILABLE ticker={ticker} action=buy "
+                    f"regime={regime_reading.get('regime')} note={regime_reading.get('note')} "
+                    f"-> veto not applied (fail-open), buy continues to the normal checks"
+                )
             current_qty = get_position_qty(client, ticker)
             if current_qty > 0:
                 log_signal(action, ticker, "blocked", "approve: already long")
