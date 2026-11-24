@@ -509,6 +509,37 @@ def is_shortable(client, ticker: str) -> bool:
     except Exception:
         return False
 
+def parse_stop_value(stop_raw):
+    """Return (stop, None) for a usable positive number, else (None, (reason, message))."""
+    if stop_raw is None or (isinstance(stop_raw, str) and not stop_raw.strip()):
+        return None, ("stop_required", "a buy must include a stop price; buys without a stop are rejected")
+    if isinstance(stop_raw, bool):
+        return None, ("bad_stop", "stop must be a number")
+    try:
+        stop = float(stop_raw)
+    except Exception:
+        return None, ("bad_stop", "stop must be a number")
+    if not math.isfinite(stop):
+        return None, ("bad_stop", "stop must be a finite number")
+    if stop <= 0:
+        return None, ("bad_stop", "stop must be greater than 0")
+    return stop, None
+
+def bad_stop_rejection(action: str, ticker: str, stop_raw, reason: str, message: str, entry=None):
+    """422 response for a buy whose stop is missing or invalid. Logged like every other block."""
+    log_signal(action, ticker, "blocked", f"approve: {reason} ({message})")
+    content = {
+        "status": "rejected",
+        "reason": reason,
+        "action": action,
+        "ticker": ticker,
+        "stop_received": stop_raw if isinstance(stop_raw, (int, float, str, type(None))) else str(stop_raw),
+        "message": f"Buy rejected: {message}.",
+    }
+    if entry is not None:
+        content["entry_price"] = entry
+    return JSONResponse(status_code=422, content=content)
+
 def compute_qty(equity: float, entry: float, stop: float, risk_pct: float) -> int:
     """Risk-based quantity. Returns 0 if invalid."""
     if entry <= 0 or stop <= 0:
@@ -694,55 +725,50 @@ async def approve(request: Request):
                 log_signal(action, ticker, "blocked", f"approve: max positions ({MAX_POSITIONS})")
                 return {"status": "ignored", "reason": "max_positions", "message": f"Max positions ({MAX_POSITIONS}) reached"}
 
-            # Sizing
-            if stop_raw is not None:
-                try:
-                    stop = float(stop_raw)
-                except Exception:
-                    return {"status": "ignored", "reason": "bad_stop", "message": "stop must be a number"}
-                # Need a reference entry; use last trade price or reject if missing
-                # For simplicity we require the caller to have a reasonable stop relative to current price.
-                # We fetch a quote if possible; fall back to rejecting if we cannot size.
+            # Sizing: every buy must carry a valid protective stop. There is no unprotected
+            # fixed-size fallback any more; a missing or invalid stop is rejected with a 422.
+            stop, stop_error = parse_stop_value(stop_raw)
+            if stop_error:
+                return bad_stop_rejection(action, ticker, stop_raw, *stop_error)
+            # Need a reference entry; use last trade price or reject if missing
+            # For simplicity we require the caller to have a reasonable stop relative to current price.
+            # We fetch a quote if possible; fall back to rejecting if we cannot size.
+            entry = None
+            try:
+                # Use latest trade via data client if available; otherwise require stop only and use account last price proxy
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockLatestTradeRequest
+                data_client = StockHistoricalDataClient(get_alpaca_key(), get_alpaca_secret())
+                trade = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
+                entry = float(trade[ticker].price)
+            except Exception:
                 entry = None
-                try:
-                    # Use latest trade via data client if available; otherwise require stop only and use account last price proxy
-                    from alpaca.data.historical import StockHistoricalDataClient
-                    from alpaca.data.requests import StockLatestTradeRequest
-                    data_client = StockHistoricalDataClient(get_alpaca_key(), get_alpaca_secret())
-                    trade = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
-                    entry = float(trade[ticker].price)
-                except Exception:
-                    entry = None
-                if entry is None:
-                    return {"status": "ignored", "reason": "no_price", "message": "Could not determine entry price for sizing"}
-                if stop >= entry:
-                    return {"status": "ignored", "reason": "bad_stop", "message": "stop must be below entry for a long"}
-                if (entry - stop) / entry < MIN_STOP_PCT:
-                    return {"status": "ignored", "reason": "bad_stop", "message": f"stop must be at least {MIN_STOP_PCT*100:.1f}% below entry"}
-                qty = compute_qty(equity, entry, stop, RISK_PCT)
-                if qty <= 0:
-                    return {"status": "ignored", "reason": "size_zero", "message": "computed quantity is 0"}
-            else:
-                qty = TEST_QTY
+            if entry is None:
+                return {"status": "ignored", "reason": "no_price", "message": "Could not determine entry price for sizing"}
+            if stop >= entry:
+                return bad_stop_rejection(
+                    action, ticker, stop_raw, "bad_stop",
+                    f"stop {stop} must be below the current price {entry} for a long", entry=entry,
+                )
+            if (entry - stop) / entry < MIN_STOP_PCT:
+                return bad_stop_rejection(
+                    action, ticker, stop_raw, "bad_stop",
+                    f"stop must be at least {MIN_STOP_PCT*100:.1f}% below entry", entry=entry,
+                )
+            qty = compute_qty(equity, entry, stop, RISK_PCT)
+            if qty <= 0:
+                return {"status": "ignored", "reason": "size_zero", "message": "computed quantity is 0"}
 
             side = OrderSide.BUY
-            # OTO entry with a GTC protective stop if stop provided
-            if stop_raw is not None:
-                order_data = MarketOrderRequest(
-                    symbol=ticker,
-                    qty=qty,
-                    side=side,
-                    time_in_force=TimeInForce.GTC,
-                    order_class=OrderClass.OTO,
-                    stop_loss=StopLossRequest(stop_price=round(stop, 2)),
-                )
-            else:
-                order_data = MarketOrderRequest(
-                    symbol=ticker,
-                    qty=qty,
-                    side=side,
-                    time_in_force=TimeInForce.DAY,
-                )
+            # OTO entry with a GTC protective stop (always present for buys now)
+            order_data = MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.OTO,
+                stop_loss=StopLossRequest(stop_price=round(stop, 2)),
+            )
 
         # ---------- SHORT ----------
         elif action == "short":

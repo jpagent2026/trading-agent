@@ -126,16 +126,11 @@ def test_pending_non_stop_order_still_blocks(main):
     client.submit_order.assert_not_called()
 
 
-def test_buy_without_stop_is_plain_3_share_day_market_order(main):
-    assert main.TEST_QTY == 3  # code default when TEST_QTY env is unset
+def test_buy_without_stop_is_rejected_no_3_share_fallback(main):
+    # The old unprotected fixed-size (TEST_QTY=3) fallback for stop-less buys is gone.
     client = make_client()
-    body = post_approve(main, client, {"action": "buy", "ticker": "PSX"}).json()
-    assert body["status"] == "success", body
-    assert body["qty"] == 3
-    req = client.submit_order.call_args.args[0]
-    assert req.qty == 3
-    assert req.side == OrderSide.BUY
-    assert req.type == OrderType.MARKET
-    assert req.time_in_force == TimeInForce.DAY
-    assert req.order_class in (None, OrderClass.SIMPLE)
-    assert req.stop_loss is None
+    resp = post_approve(main, client, {"action": "buy", "ticker": "PSX"})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["status"] == "rejected" and body["reason"] == "stop_required", body
+    client.submit_order.assert_not_called()
