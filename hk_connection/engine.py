@@ -7,18 +7,29 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Callable, Iterable, Optional
 
 from . import rules, scanner
 from .bars import ET, Bar, SessionState, in_regular_session, minutes_since_open, to_et
-from .broker import Broker, stop_leg_id
+from .broker import OPEN_ORDER_STATUSES, Broker, PlaceStopFn, is_stop_through_market_error, stop_leg_id
 from .config import Settings
 from .ledger import Ledger, utcnow
 
 log = logging.getLogger("hk_connection.engine")
 
 INDEX_AND_INVERSE = set(rules.INVERSE_ETF_MAP) | set(rules.INVERSE_ETF_MAP.values())
+
+BREACH_RETRY_S = 60         # periodic check: at most one exit attempt per trade per minute
+BROKER_STOP_GRACE_S = 60    # in regular hours, give a live broker stop this long to trigger before we act
+TRIGGERABLE_STOP_STATUSES = ("new", "accepted", "pending_new", "partially_filled")
+
+
+def stop_breached(direction: str, price: Optional[float], stop: Optional[float]) -> bool:
+    """Long: price at or below the stop. Short stock: price at or above the stop."""
+    if not price or not stop:
+        return False
+    return price <= stop if direction == "long" else price >= stop
 
 
 def _s(v: Any) -> str:
@@ -39,6 +50,9 @@ class Engine:
         self.earnings: dict[str, dict] = {}          # symbol -> {'date': date, 'hour': str}
         self.earnings_ok = False                     # False until a calendar fetch succeeded today
         self.session_date: Optional[str] = None
+        self._breach_attempt: dict[int, datetime] = {}   # trade id -> last periodic exit attempt
+        self._breach_seen: dict[int, datetime] = {}      # trade id -> first time seen through a live broker stop
+        self._breach_deferred_logged: set[int] = set()
 
     # ================================================================ helpers
     def today_et(self) -> date:
@@ -212,7 +226,8 @@ class Engine:
             return
         remaining = int(t["qty_open"]) - q
         try:
-            sell, stop = self.broker.partial_exit(symbol, t["direction"], q, remaining, t["stop_price"])
+            sell, stop = self.broker.partial_exit(symbol, t["direction"], q, remaining, t["stop_price"],
+                                                  place_stop=self.guarded_place_stop(t, "trim"))
         except Exception as e:
             self.ledger.event("error", t["id"], where="partial_exit", error=str(e))
             return
@@ -255,6 +270,7 @@ class Engine:
                                          qty_initial=fq, qty_open=fq,
                                          stop_order_id=t["stop_order_id"] or stop_leg_id(o))
                 self.ledger.event("entry_filled", t["id"], price=float(o.filled_avg_price), qty=fq)
+                self._check_entry_stop_leg(t, fq, t["stop_order_id"] or stop_leg_id(o))
             elif st in ("canceled", "rejected", "expired"):
                 self.ledger.update_trade(t["id"], status="rejected", exit_reason=st)
                 self.ledger.event("entry_" + st, t["id"])
@@ -277,6 +293,8 @@ class Engine:
         self.ledger.save_streak(streak)
         self.ledger.event("trade_closed", t["id"], price=price, pnl=total, reason=reason,
                           consecutive_losses=streak.consecutive_losses, paused_until=streak.paused_until)
+        if str(reason).startswith("stop breach"):
+            self.ledger.mark_stop_breach_filled(t["id"])
 
     # ================================================================ daily jobs
     def open_job(self) -> None:
@@ -285,10 +303,13 @@ class Engine:
             for t in self.ledger.open_trades():
                 if t["status"] == "open" and t["pending_exit"]:
                     try:
-                        o = self.broker.full_exit(t["symbol"], t["direction"])
-                        self.ledger.update_trade(t["id"], exit_order_id=str(getattr(o, "id", "")) if o else None,
+                        # flatten = cancel stops, then sell what is held net of exit orders already working,
+                        # so an exit that is already queued (e.g. a stop-breach exit) is never doubled.
+                        o, qty, pending = self.broker.flatten(t["symbol"], t["direction"])
+                        self.ledger.update_trade(t["id"], exit_order_id=str(getattr(o, "id", "")) if o else t["exit_order_id"],
                                                  exit_reason=t["pending_exit"], pending_exit=None)
-                        self.ledger.event("exit_submitted", t["id"], reason=t["pending_exit"])
+                        self.ledger.event("exit_submitted", t["id"], reason=t["pending_exit"], qty=qty,
+                                          already_pending_qty=pending)
                     except Exception as e:
                         self.ledger.event("error", t["id"], where="open_job", error=str(e))
 
@@ -321,6 +342,8 @@ class Engine:
             for t in self.ledger.open_trades():
                 if t["status"] != "open" or t["pending_exit"] or int(t["qty_open"] or 0) <= 0:
                     continue
+                if self._exit_pending(t, rth=False):  # a (stop-breach) exit is already working: no new stop
+                    continue
                 age_days = 0.0
                 if t["stop_placed_at"]:
                     placed = datetime.fromisoformat(t["stop_placed_at"])
@@ -335,7 +358,11 @@ class Engine:
                     live = False
                 if age_days >= rules.GTC_REFRESH_AFTER_DAYS or not live:
                     try:
-                        o = self.broker.refresh_stop(t["symbol"], int(t["qty_open"]), t["direction"], t["stop_price"])
+                        o = self.broker.refresh_stop(t["symbol"], int(t["qty_open"]), t["direction"], t["stop_price"],
+                                                     place_stop=self.guarded_place_stop(t, "gtc_refresh"))
+                        if o is None:  # price already through the stop: flattened instead (see stop_breach_exits)
+                            self.ledger.event("stop_refresh_replaced_by_exit", t["id"], age_days=round(age_days, 1))
+                            continue
                         self.ledger.update_trade(t["id"], stop_order_id=str(o.id), stop_placed_at=utcnow())
                         self.ledger.event("stop_refreshed", t["id"], age_days=round(age_days, 1), was_live=live)
                         refreshed.append(t["id"])
@@ -365,7 +392,8 @@ class Engine:
                         if rem <= 0:
                             act = "exit"
                         else:
-                            self.broker.partial_exit(t["symbol"], t["direction"], q, rem, t["stop_price"])
+                            self.broker.partial_exit(t["symbol"], t["direction"], q, rem, t["stop_price"],
+                                                     place_stop=self.guarded_place_stop(t, "earnings_sell_half"))
                             sign = 1 if t["direction"] == "long" else -1
                             self.ledger.update_trade(t["id"], qty_open=rem,
                                                      realized_pnl=(t["realized_pnl"] or 0) + sign * (last - t["entry_price"]) * q)
@@ -383,6 +411,188 @@ class Engine:
         with self.lock:
             s = rules.update_equity_peak(self.ledger.load_streak(), self.broker.equity())
             self.ledger.save_streak(s)
+
+    # ================================================================ stop enforcement
+    # HK never holds a position that is through its stop. Every stop placement goes through
+    # guarded_place_stop, and enforce_stops runs at startup, at the open and every scheduler cycle.
+    def is_rth(self) -> bool:
+        et = to_et(self.now())
+        return et.weekday() < 5 and in_regular_session(et)
+
+    def latest_prices(self, symbols: Iterable[str]) -> dict[str, tuple[float, str]]:
+        """symbol -> (price, source). SIP latest trade first (includes extended-hours prints), then the
+        broker position's current_price, then the last streamed 1-minute close."""
+        syms = sorted({s for s in symbols if s})
+        out: dict[str, tuple[float, str]] = {}
+        if not syms:
+            return out
+        if self.data is not None:
+            try:
+                res = self.data.latest_prices(syms)
+                if isinstance(res, dict):
+                    for s, p in res.items():
+                        if isinstance(p, (int, float)) and not isinstance(p, bool) and p > 0:
+                            out[s] = (float(p), "sip_latest_trade")
+            except Exception as e:
+                log.warning("latest price fetch failed: %s", e)
+        missing = [s for s in syms if s not in out]
+        if missing:
+            pos: dict[str, float] = {}
+            try:
+                for p in self.broker.positions():
+                    try:
+                        pos[str(p.symbol).upper()] = float(p.current_price)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            for s in missing:
+                if pos.get(s.upper(), 0) > 0:
+                    out[s] = (pos[s.upper()], "broker_position")
+                elif s in self.sessions and self.sessions[s].last > 0:
+                    out[s] = (self.sessions[s].last, "stream_last_bar")
+        return out
+
+    def _exit_pending(self, t: dict, rth: bool) -> Optional[str]:
+        """An exit already on its way for this trade (the broker-side check, net quantities, is in Broker.flatten)."""
+        if t.get("pending_exit") and (not rth or to_et(self.now()).time() < time(9, 31)):
+            return "queued for the open job: " + str(t["pending_exit"])
+        if t.get("exit_order_id"):
+            try:
+                st = _s(self.broker.get_order(t["exit_order_id"]).status)
+            except Exception:
+                st = ""
+            if st in OPEN_ORDER_STATUSES or st == "filled":
+                return f"exit order {t['exit_order_id']} is {st}"
+        return None
+
+    def flatten_breach(self, t: dict, price: Optional[float], price_source: Optional[str], reason: str,
+                       context: str, rth: Optional[bool] = None, error: Optional[str] = None) -> Optional[Any]:
+        """Market order (DAY) for the full remaining position of a trade whose stop is breached.
+        Outside regular hours Alpaca queues the DAY market order for the next open; if that submission
+        is refused, the exit is queued in the ledger (pending_exit) for the 9:30 open job instead."""
+        rth = self.is_rth() if rth is None else rth
+        sym, d = t["symbol"], t["direction"]
+        ev = dict(symbol=sym, direction=d, stop=t["stop_price"], trigger_price=price,
+                  price_source=price_source, reason=reason, context=context)
+        rec = dict(ev, trade_id=t["id"])
+        log.warning("STOP BREACH %s %s: price %s through stop %s [%s/%s]%s", d, sym, price, t["stop_price"],
+                    reason, context, f" broker error: {error}" if error else "")
+        pend = self._exit_pending(t, rth)
+        if pend:
+            self.ledger.record_stop_breach(qty=0, status="already_pending", error=pend, **rec)
+            self.ledger.event("stop_breach_exit", t["id"], status="already_pending", detail=pend, **ev)
+            return None
+        try:
+            o, qty, pending = self.broker.flatten(sym, d)
+        except Exception as e:
+            if rth:
+                self.ledger.record_stop_breach(qty=int(t["qty_open"] or 0), status="failed", error=str(e), **rec)
+                self.ledger.event("error", t["id"], where="stop_breach_exit", error=str(e), **ev)
+            else:
+                self.ledger.update_trade(t["id"], pending_exit=f"stop breach ({reason})")
+                self.ledger.record_stop_breach(qty=int(t["qty_open"] or 0), status="queued_for_open",
+                                               error=str(e), **rec)
+                self.ledger.event("stop_breach_exit", t["id"], status="queued_for_open", error=str(e), **ev)
+            return None
+        if o is None:
+            status = "already_pending" if pending > 0 else "no_position"
+            if pending > 0:
+                self.ledger.record_stop_breach(qty=0, status=status, error=f"{pending} shares already in exit orders",
+                                               **rec)
+            self.ledger.event("stop_breach_exit", t["id"], status=status, pending_qty=pending, **ev)
+            return None
+        oid = str(getattr(o, "id", ""))
+        self.ledger.update_trade(t["id"], exit_order_id=oid, exit_reason=f"stop breach ({reason})", pending_exit=None)
+        self.ledger.record_stop_breach(qty=qty, order_id=oid, status="submitted", error=error, **rec)
+        self.ledger.event("stop_breach_exit", t["id"], status="submitted", qty=qty, order_id=oid,
+                          already_pending_qty=pending, rth=rth, broker_error=error, **ev)
+        return o
+
+    def guarded_place_stop(self, t: dict, context: str, rth: Optional[bool] = None) -> PlaceStopFn:
+        """A place_stop replacement for the broker: checks the latest price first and, if the price is
+        already through the stop (or Alpaca rejects the stop as through the market), market-exits the
+        whole remaining position instead. Returns the stop order, or None when it exited instead."""
+        def place(symbol: str, qty: int, direction: str, stop_price: float) -> Optional[Any]:
+            px = self.latest_prices([symbol]).get(symbol)
+            if px and stop_breached(direction, px[0], stop_price):
+                self.flatten_breach(t, px[0], px[1], "pre_check", context, rth)
+                return None
+            try:
+                return self.broker.place_stop(symbol, qty, direction, stop_price)
+            except Exception as e:
+                px2 = self.latest_prices([symbol]).get(symbol) or px
+                if is_stop_through_market_error(e) or (px2 and stop_breached(direction, px2[0], stop_price)):
+                    self.flatten_breach(t, px2[0] if px2 else None, px2[1] if px2 else None, "broker_reject",
+                                        context, rth, error=str(e))
+                    return None
+                raise
+        return place
+
+    def _check_entry_stop_leg(self, t: dict, qty: int, leg_id: Optional[str]) -> None:
+        """After an entry fills: if its OTO stop leg was rejected/cancelled, put the stop back (guarded)."""
+        st = ""
+        if leg_id:
+            try:
+                st = _s(self.broker.get_order(leg_id).status)
+            except Exception:
+                return
+        if st not in ("rejected", "canceled", "cancelled", "expired"):
+            return
+        self.ledger.event("entry_stop_leg_" + st, t["id"], stop_order_id=leg_id)
+        t = dict(t, status="open", qty_open=qty)
+        o = self.guarded_place_stop(t, "entry")(t["symbol"], qty, t["direction"], t["stop_price"])
+        if o is not None:
+            self.ledger.update_trade(t["id"], stop_order_id=str(getattr(o, "id", "")), stop_placed_at=utcnow())
+
+    def enforce_stops(self, context: str = "cycle", rth: Optional[bool] = None) -> list[int]:
+        """For every open position: if the latest price is through its ledger stop and no exit is filled or
+        working, market-exit it. A live, un-triggered broker stop that is also through the price is left to
+        the broker outside regular hours (Alpaca triggers it at the open) and for BROKER_STOP_GRACE_S during
+        regular hours; after that it is cancelled and replaced by a market order."""
+        acted: list[int] = []
+        with self.lock:
+            rth = self.is_rth() if rth is None else rth
+            trades = [t for t in self.ledger.open_trades()
+                      if t["status"] == "open" and t["stop_price"] and int(t["qty_open"] or 0) > 0]
+            if not trades:
+                return acted
+            prices = self.latest_prices(t["symbol"] for t in trades)
+            now = self.now()
+            for t in trades:
+                tid, sym, d = t["id"], t["symbol"], t["direction"]
+                try:
+                    px = prices.get(sym)
+                    if not px or not stop_breached(d, px[0], t["stop_price"]):
+                        self._breach_seen.pop(tid, None)
+                        self._breach_deferred_logged.discard(tid)
+                        continue
+                    last = self._breach_attempt.get(tid)
+                    if last is not None and (now - last).total_seconds() < BREACH_RETRY_S:
+                        continue
+                    if self._exit_pending(t, rth):
+                        continue
+                    live = [o for o in self.broker.live_stops(sym)
+                            if _s(getattr(o, "status", "")) in TRIGGERABLE_STOP_STATUSES
+                            and stop_breached(d, px[0], _float(getattr(o, "stop_price", None)))]
+                    if live:
+                        if rth:  # the grace period only counts regular-hours time, when the stop can trigger
+                            first = self._breach_seen.setdefault(tid, now)
+                        else:
+                            self._breach_seen.pop(tid, None)
+                        if not rth or (now - first).total_seconds() < BROKER_STOP_GRACE_S:
+                            if tid not in self._breach_deferred_logged:
+                                self._breach_deferred_logged.add(tid)
+                                self.ledger.event("stop_breach_deferred_to_broker_stop", tid, symbol=sym, price=px[0],
+                                                  stop=t["stop_price"], rth=rth, context=context,
+                                                  stop_order_ids=[str(o.id) for o in live])
+                            continue
+                    self._breach_attempt[tid] = now
+                    self.flatten_breach(t, px[0], px[1], "periodic", context, rth)
+                    acted.append(tid)
+                except Exception as e:
+                    self.ledger.event("error", tid, where="enforce_stops", error=str(e))
+        return acted
 
     # ================================================================ scans
     def after_close_scan(self, next_session: date) -> list[dict]:
@@ -458,6 +668,13 @@ class Engine:
             self.ledger.event("warning", None, where="hourly_ema", error=str(e))
         self.ledger.event("scan_pre_open", None, session=today.isoformat(), watchlist=len(wl))
         return wl
+
+
+def _float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 
 def _dedupe(seq: list[str]) -> list[str]:

@@ -54,6 +54,22 @@ CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS stop_breach_exits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    trade_id INTEGER,
+    symbol TEXT NOT NULL,
+    direction TEXT,
+    qty INTEGER,                     -- shares in the exit order (0 when nothing was sent)
+    stop REAL,                       -- the ledger stop that was breached
+    trigger_price REAL,              -- latest price that showed the breach
+    price_source TEXT,
+    reason TEXT NOT NULL,            -- 'pre_check' | 'broker_reject' | 'periodic'
+    context TEXT,                    -- where it fired: entry/trim/earnings_sell_half/gtc_refresh/startup/open/cycle
+    order_id TEXT,
+    status TEXT NOT NULL,            -- submitted | already_pending | queued_for_open | no_position | failed | filled
+    error TEXT
+);
 CREATE TABLE IF NOT EXISTS watchlist (
     session_date TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -144,6 +160,24 @@ class Ledger:
                           "SUM(CASE WHEN realized_pnl<0 THEN 1 ELSE 0 END) AS l FROM trades WHERE status='closed'")
         r = rows[0]
         return {"closed": r["n"] or 0, "winners": r["w"] or 0, "losers": r["l"] or 0}
+
+    # ------------------------------------------------------------ stop-breach exits
+    def record_stop_breach(self, **f: Any) -> int:
+        f.setdefault("ts", utcnow())
+        cols = ",".join(f.keys())
+        qs = ",".join("?" for _ in f)
+        cur = self._exec(f"INSERT INTO stop_breach_exits ({cols}) VALUES ({qs})", tuple(f.values()))
+        return int(cur.lastrowid)
+
+    def stop_breach_exits(self, limit: int = 50) -> list[dict]:
+        rows = self._rows("SELECT * FROM stop_breach_exits ORDER BY id DESC LIMIT ?", (limit,))
+        for r in rows:
+            r["time"] = r["ts"]
+        return rows
+
+    def mark_stop_breach_filled(self, trade_id: int) -> None:
+        self._exec("UPDATE stop_breach_exits SET status='filled' WHERE trade_id=? AND status IN "
+                   "('submitted','already_pending')", (trade_id,))
 
     # ------------------------------------------------------------ state
     def get_state(self, key: str, default: Any = None) -> Any:

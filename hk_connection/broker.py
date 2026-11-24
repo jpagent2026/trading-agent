@@ -4,12 +4,14 @@
 - Partial sells: cancel the stop -> sell the portion -> re-place a GTC stop for the remaining shares.
 - Full exits: cancel the stop -> market order for the whole position.
 - GTC refresh: Alpaca cancels GTC orders after 90 days, so stops are re-placed before that.
+- Stop-breach flatten: when a stop can't be placed because price is already through it, cancel any stop and
+  market-sell (or buy to cover) what is held, net of exit orders already working (no double submits).
 """
 from __future__ import annotations
 
 import logging
 import time as _time
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
@@ -18,6 +20,21 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, StopLo
 log = logging.getLogger("hk_connection.broker")
 
 LIVE_STOP_STATUSES = ("new", "held", "accepted", "pending_new", "partially_filled")
+OPEN_ORDER_STATUSES = ("new", "held", "accepted", "pending_new", "partially_filled", "accepted_for_bidding",
+                       "pending_replace", "calculated")
+
+_THROUGH_MARKET_HINTS = ("base price", "current price", "market price", "last price", "must be less", "must be below",
+                         "must be greater", "must be above", "must not be greater", "must not be less",
+                         "less than", "greater than", "below", "above")
+
+PlaceStopFn = Callable[[str, int, str, float], Any]
+
+
+def is_stop_through_market_error(err: BaseException) -> bool:
+    """True when Alpaca refused a stop because its price is already through the market, e.g.
+    'stop price must not be greater than base price' (sell stop above the last price)."""
+    msg = str(err).lower()
+    return "stop" in msg and any(h in msg for h in _THROUGH_MARKET_HINTS)
 
 
 def make_trading_client(key_id: str, secret_key: str) -> TradingClient:
@@ -160,16 +177,18 @@ class Broker:
 
     # ------------------------------------------------------------ exits
     def partial_exit(self, symbol: str, direction: str, sell_qty: int, remaining_qty: int,
-                     stop_price: float) -> tuple[Any, Any]:
+                     stop_price: float, place_stop: Optional[PlaceStopFn] = None) -> tuple[Any, Any]:
         """cancel stop -> sell/cover sell_qty -> re-place stop for remaining_qty. If the sell is rejected,
-        the stop is put back for the full quantity so the position is never left unprotected."""
+        the stop is put back for the full quantity so the position is never left unprotected.
+        `place_stop` lets the engine route the re-placement through its stop-breach guard."""
+        ps = place_stop or self.place_stop
         self.cancel_stops(symbol)
         try:
             sell = self.client.submit_order(build_exit_order(symbol, sell_qty, direction))
         except Exception:
-            self.place_stop(symbol, sell_qty + remaining_qty, direction, stop_price)
+            ps(symbol, sell_qty + remaining_qty, direction, stop_price)
             raise
-        stop = self.place_stop(symbol, remaining_qty, direction, stop_price) if remaining_qty > 0 else None
+        stop = ps(symbol, remaining_qty, direction, stop_price) if remaining_qty > 0 else None
         return sell, stop
 
     def full_exit(self, symbol: str, direction: str, qty: Optional[int] = None) -> Optional[Any]:
@@ -179,10 +198,53 @@ class Broker:
             return None
         return self.client.submit_order(build_exit_order(symbol, q, direction))
 
-    def refresh_stop(self, symbol: str, qty: int, direction: str, stop_price: float) -> Any:
+    def refresh_stop(self, symbol: str, qty: int, direction: str, stop_price: float,
+                     place_stop: Optional[PlaceStopFn] = None) -> Any:
         """Re-place the protective stop (same price, current qty) to restart Alpaca's 90-day GTC clock."""
         self.cancel_stops(symbol)
-        return self.place_stop(symbol, qty, direction, stop_price)
+        return (place_stop or self.place_stop)(symbol, qty, direction, stop_price)
+
+    # ------------------------------------------------------------ stop-breach flatten
+    def open_exit_orders(self, symbol: str, direction: str) -> list[Any]:
+        """Working (unfilled) non-stop orders on the exit side for this symbol: market/limit sells for a
+        long, buys for a short. Used so a breach exit is never submitted twice."""
+        side = _s(exit_side(direction))
+        out, seen = [], set()
+        orders = self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], nested=True))
+        for o in _flatten(orders):
+            oid = str(getattr(o, "id", ""))
+            if not oid or oid in seen:
+                continue
+            seen.add(oid)
+            if str(getattr(o, "symbol", symbol) or symbol).upper() != symbol.upper():
+                continue
+            if "stop" in _s(getattr(o, "order_type", getattr(o, "type", ""))):
+                continue
+            if _s(getattr(o, "side", "")) != side or _s(getattr(o, "status", "")) not in OPEN_ORDER_STATUSES:
+                continue
+            out.append(o)
+        return out
+
+    @staticmethod
+    def _unfilled(o: Any) -> int:
+        try:
+            q = float(getattr(o, "qty", 0) or 0)
+            f = float(getattr(o, "filled_qty", 0) or 0)
+            return max(int(round(q - f)), 0)
+        except Exception:
+            return 0
+
+    def flatten(self, symbol: str, direction: str) -> Tuple[Optional[Any], int, int]:
+        """Cancel live stops, then market DAY order for (position qty - qty already working in exit orders).
+        Returns (order or None, qty submitted, qty already pending). Outside regular hours Alpaca accepts the
+        DAY market order and queues it for the next open. Working orders are read BEFORE the position so a
+        fill in between can only make us under-sell (fixed next cycle), never over-sell into a reverse position."""
+        self.cancel_stops(symbol)
+        pending = sum(self._unfilled(o) for o in self.open_exit_orders(symbol, direction))
+        need = self.position_qty(symbol) - pending
+        if need <= 0:
+            return None, 0, pending
+        return self.client.submit_order(build_exit_order(symbol, need, direction)), need, pending
 
     def get_order(self, order_id: str) -> Any:
         return self.client.get_order_by_id(order_id)

@@ -27,7 +27,8 @@ It shares nothing with Agent 200 (`main.py`): it has its own entrypoint, Alpaca 
 ## Daily timeline (ET, trading days only)
 
 08:45 pre-open scan (premarket screen, earnings calendar, hourly EMAs) · 09:25 start SIP 1-min stream ·
-09:30:30 exits queued by last night's trail · 09:31–11:30 entries · all session: trims, reconcile every minute ·
+09:30:30 exits queued by last night's trail · 09:31–11:30 entries · all session: trims, reconcile every minute,
+stop-breach check every cycle (also once at process start; see DECISIONS.md E1–E6) ·
 15:30 earnings check · 16:01 stop stream · 16:10 EMA trail, 90-day GTC refresh, equity peak ·
 17:15 after-close scan for the next session.
 

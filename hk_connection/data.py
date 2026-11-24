@@ -125,6 +125,27 @@ class MarketData:
                     continue
         return out
 
+    def latest_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Latest SIP trade price per symbol (includes pre-market / after-hours prints). Used by the
+        stop-breach guard; symbols that fail are simply missing from the result."""
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockLatestTradeRequest
+        out: dict[str, float] = {}
+        for chunk in _chunks(sorted(set(symbols)), BATCH):
+            try:
+                res = self.hist.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=chunk, feed=DataFeed.SIP))
+            except Exception as e:
+                log.warning("latest trade batch failed: %s", e)
+                continue
+            for sym, tr in (res or {}).items():
+                try:
+                    px = float(tr.price)
+                    if px > 0:
+                        out[sym] = px
+                except Exception:
+                    continue
+        return out
+
     # ------------------------------------------------------------ Finnhub
     def earnings(self, start: date, end: date) -> dict[str, dict]:
         """symbol -> {'date': date, 'hour': 'bmo'|'amc'|'dmh'|''} (earliest in the window)."""

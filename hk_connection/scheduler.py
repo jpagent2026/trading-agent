@@ -5,6 +5,8 @@ Daily timeline (America/New_York, trading days only, per Alpaca's market calenda
   09:25  start the SIP 1-minute bar stream (backfills today's bars if started late)
   09:30:30 open job: execute exits queued by last night's EMA trail
   09:30-16:05 reconcile with Alpaca every minute (fills, stop-outs, losing streak)
+  09:30-16:00 stop enforcement every loop cycle (~10 s): a position through its stop is market-exited
+              (also once at process startup, any time of day, and labelled 'open' on the first cycle after 9:30)
   09:31-11:30 entries allowed (rules.ENTRY_WINDOW_MINUTES); trims monitored all session
   15:30  earnings job: sell half / exit positions without cushion before a release
   16:01  stop the stream
@@ -49,6 +51,9 @@ class Scheduler:
         self.done: dict[str, str] = {}        # job name -> ET date it last ran
         self.last_runs: dict[str, str] = {}   # job name -> ISO timestamp
         self.last_reconcile: Optional[datetime] = None
+        self.startup_stop_check_done = False
+        self.open_stop_check_date: Optional[str] = None
+        self.last_stop_check: Optional[str] = None
         self._trading_day_cache: dict[str, bool] = {}
         self._stop = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -81,6 +86,11 @@ class Scheduler:
         ran = []
         et = to_et(self.now())
         today = et.date()
+        if not self.startup_stop_check_done:
+            # Once at process start (any time, any day): flatten anything already through its stop.
+            self.startup_stop_check_done = True
+            rth = self.is_trading_day(today) and time(9, 30) <= et.time() < time(16, 0)
+            self._enforce_stops("startup", rth)
         if not self.is_trading_day(today):
             return ran
         for name, start, latest in JOBS:
@@ -100,7 +110,22 @@ class Scheduler:
                 self.engine.reconcile()
                 self.last_reconcile = self.now()
                 ran.append("reconcile")
+        if time(9, 30) <= et.time() < time(16, 0):
+            ctx = "cycle" if self.open_stop_check_date == today.isoformat() else "open"
+            self.open_stop_check_date = today.isoformat()
+            self._enforce_stops(ctx, True)
         return ran
+
+    def _enforce_stops(self, context: str, rth: bool) -> None:
+        try:
+            self.engine.enforce_stops(context, rth)
+            self.last_stop_check = to_et(self.now()).isoformat()
+        except Exception as e:
+            log.exception("stop enforcement failed")
+            try:
+                self.engine.ledger.event("error", None, where="enforce_stops", context=context, error=str(e))
+            except Exception:
+                pass
 
     def run_forever(self, interval_s: float = 10.0) -> None:
         while not self._stop.is_set():
