@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def main(tmp_path, monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test-key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test-secret")
-    for var in ("TEST_QTY", "RISK_PCT", "MAX_POSITION_PCT", "MIN_STOP_PCT", "MAX_TRADES_PER_DAY",
+    for var in ("RISK_PCT", "MAX_POSITION_PCT", "MIN_STOP_PCT", "MAX_TRADES_PER_DAY",
                 "MAX_POSITIONS", "DAILY_LOSS_LIMIT_PCT", "SHORTS_ENABLED"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.syspath_prepend(str(REPO_ROOT))
