@@ -47,3 +47,53 @@ def test_scheduler_runs_jobs_on_et_timeline():
     clock.t = et(10, 0, SESSION + timedelta(days=3))  # Saturday
     assert sch.tick() == []
     assert sch.next_trading_day(SESSION) == SESSION + timedelta(days=1)
+
+
+THANKSGIVING = date(2026, 11, 26)  # Thursday, market closed; the live redeploy day
+
+
+def test_startup_fetches_earnings_calendar_on_a_holiday(settings, broker, ledger):
+    """A holiday/weekend redeploy used to leave earnings_calendar_ok false until the next
+    trading day's 08:45 pre-open scan. Startup now fetches the calendar any day."""
+    from hk_connection.engine import Engine
+
+    clock = Clock(et(10, 13, THANKSGIVING))
+    engine = Engine(settings, broker, ledger, data=MagicMock(name="MarketData"), now=clock)
+    assert engine.earnings_ok is False
+    cal = {"ABC": {"date": date(2026, 12, 1), "hour": "amc"}}
+    engine.data.earnings.return_value = cal
+    engine.data.trading_days.return_value = []
+    sch = Scheduler(engine, now=clock)
+    assert sch.tick() == []
+    assert engine.earnings_ok is True
+    assert engine.earnings == cal
+    engine.data.earnings.assert_called_once_with(THANKSGIVING, THANKSGIVING + timedelta(days=14))
+    sch.tick()
+    engine.data.earnings.assert_called_once()  # not fetched again
+
+
+def test_startup_earnings_fetch_failure_leaves_flag_false(settings, broker, ledger):
+    from hk_connection.engine import Engine
+
+    clock = Clock(et(10, 13, THANKSGIVING))
+    engine = Engine(settings, broker, ledger, data=MagicMock(name="MarketData"), now=clock)
+    engine.data.earnings.side_effect = RuntimeError("finnhub 403")
+    engine.data.trading_days.return_value = []
+    sch = Scheduler(engine, now=clock)
+    assert sch.tick() == []
+    assert engine.earnings_ok is False
+    assert engine.earnings == {}
+    evs = [e for e in ledger.events(20) if e["kind"] == "warning"]
+    assert evs and evs[0]["detail"]["where"] == "earnings_startup"
+    assert "finnhub 403" in evs[0]["detail"]["error"]
+
+
+def test_refresh_earnings_job_retry_keeps_holdings_warning(settings, broker, ledger):
+    from hk_connection.engine import Engine
+
+    engine = Engine(settings, broker, ledger, data=MagicMock(name="MarketData"))
+    engine.data.earnings.side_effect = RuntimeError("finnhub down")
+    assert engine.refresh_earnings(SESSION, where="earnings_job") is False
+    evs = [e for e in ledger.events(20) if e["kind"] == "warning"]
+    assert evs[0]["detail"]["where"] == "earnings_job"
+    assert evs[0]["detail"]["error"] == "earnings calendar unavailable, holdings not checked: finnhub down"

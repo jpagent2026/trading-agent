@@ -1,6 +1,8 @@
 """In-process, ET-aware scheduler and the real-time SIP 1-minute bar stream.
 
 Daily timeline (America/New_York, trading days only, per Alpaca's market calendar):
+  startup (any day)  fetch the earnings calendar so /status and the fail-closed entry rule
+                     work after a holiday or weekend redeploy
   08:45  pre-open scan: premarket screen, earnings calendar, hourly EMAs, load the watchlist
   09:25  start the SIP 1-minute bar stream (backfills today's bars if started late)
   09:30:30 open job: execute exits queued by last night's EMA trail
@@ -52,6 +54,7 @@ class Scheduler:
         self.last_runs: dict[str, str] = {}   # job name -> ISO timestamp
         self.last_reconcile: Optional[datetime] = None
         self.startup_stop_check_done = False
+        self.startup_earnings_done = False
         self.open_stop_check_date: Optional[str] = None
         self.last_stop_check: Optional[str] = None
         self._trading_day_cache: dict[str, bool] = {}
@@ -91,6 +94,12 @@ class Scheduler:
             self.startup_stop_check_done = True
             rth = self.is_trading_day(today) and time(9, 30) <= et.time() < time(16, 0)
             self._enforce_stops("startup", rth)
+        if not self.startup_earnings_done:
+            # Once at process start (any time, any day): load the earnings calendar. Scheduled
+            # fetches only run on trading days, so a Thanksgiving/weekend redeploy used to leave
+            # earnings_calendar_ok false until the next session's 08:45 pre-open scan.
+            self.startup_earnings_done = True
+            self._startup_refresh_earnings(today)
         if not self.is_trading_day(today):
             return ran
         for name, start, latest in JOBS:
@@ -115,6 +124,16 @@ class Scheduler:
             self.open_stop_check_date = today.isoformat()
             self._enforce_stops(ctx, True)
         return ran
+
+    def _startup_refresh_earnings(self, today: date) -> None:
+        try:
+            self.engine.refresh_earnings(today, where="earnings_startup")
+        except Exception as e:
+            log.exception("startup earnings calendar fetch failed")
+            try:
+                self.engine.ledger.event("warning", None, where="earnings_startup", error=str(e))
+            except Exception:
+                pass
 
     def _enforce_stops(self, context: str, rth: bool) -> None:
         try:
@@ -188,11 +207,7 @@ class Scheduler:
 
     def earnings_job(self, today: date) -> None:
         if not self.engine.earnings_ok:
-            try:
-                self.engine.set_earnings(self.engine.data.earnings(today, today + timedelta(days=14)), True)
-            except Exception as e:
-                self.engine.ledger.event("warning", None, where="earnings_job",
-                                         error=f"earnings calendar unavailable, holdings not checked: {e}")
+            if not self.engine.refresh_earnings(today, where="earnings_job"):
                 return
         syms = sorted({t["symbol"] for t in self.engine.ledger.open_trades()})
         adr = {}
