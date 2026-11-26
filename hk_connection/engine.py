@@ -48,7 +48,7 @@ class Engine:
         self.sessions: dict[str, SessionState] = {}
         self.watch: dict[str, list[dict]] = {}       # signal symbol -> watchlist items
         self.earnings: dict[str, dict] = {}          # symbol -> {'date': date, 'hour': str}
-        self.earnings_ok = False                     # False until a calendar fetch succeeded today
+        self.earnings_ok = False                     # False until a calendar fetch succeeds (startup, pre-open, or 15:30 retry)
         self.session_date: Optional[str] = None
         self._breach_attempt: dict[int, datetime] = {}   # trade id -> last periodic exit attempt
         self._breach_seen: dict[int, datetime] = {}      # trade id -> first time seen through a live broker stop
@@ -92,6 +92,27 @@ class Engine:
         with self.lock:
             self.earnings = cal
             self.earnings_ok = ok
+
+    def refresh_earnings(self, today: date, where: str = "earnings") -> bool:
+        """Fetch the Finnhub earnings calendar for [today, today+14 days].
+
+        On success, stores the map and sets earnings_ok True. On failure, clears the
+        map, sets earnings_ok False (the entry rule still fails closed), and logs a
+        warning. Does not change any earnings trading rules.
+        """
+        try:
+            if self.data is None:
+                raise RuntimeError("market data is not configured")
+            cal = self.data.earnings(today, today + timedelta(days=14))
+            self.set_earnings(cal, True)
+            return True
+        except Exception as e:
+            self.set_earnings({}, False)
+            err = str(e)
+            if where == "earnings_job":
+                err = f"earnings calendar unavailable, holdings not checked: {e}"
+            self.ledger.event("warning", None, where=where, error=err)
+            return False
 
     # ================================================================ intraday
     def on_bar(self, symbol: str, bar: Bar) -> None:
@@ -646,15 +667,10 @@ class Engine:
                 extra = scanner.build_watchlist(full, [s for s in up if s in full], [s for s in down if s in full],
                                                 n, self.settings.shorts_enabled, mcaps)
                 wl += [i for i in extra if i["symbol"] not in rules.INVERSE_ETF_MAP]
-        try:
-            cal = d.earnings(today, today + timedelta(days=14))
-            self.set_earnings(cal, True)
+        if self.refresh_earnings(today, where="earnings"):
             for it in wl:
-                e = cal.get(it["symbol"])
+                e = self.earnings.get(it["symbol"])
                 it["next_earnings"] = e["date"].isoformat() if e else None
-        except Exception as e:
-            self.set_earnings({}, False)
-            self.ledger.event("warning", None, where="earnings", error=str(e))
         self.ledger.save_watchlist(today.isoformat(), wl)
         self.load_watchlist(today.isoformat(), wl)
         try:
