@@ -5,8 +5,11 @@ Start command:  uvicorn hk_connection.app:app --host 0.0.0.0 --port $PORT
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 
@@ -25,6 +28,18 @@ class Runtime:
         self.engine: Any = None
         self.scheduler: Any = None
         self.error: Optional[str] = None
+
+
+# Deployed version (read-only, on /status). Railway sets RAILWAY_GIT_COMMIT_SHA and RAILWAY_DEPLOYMENT_ID
+# automatically on GitHub-triggered deploys; no env var needs to be added. Elsewhere it reads "unknown".
+PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+
+def deployed_version() -> dict:
+    sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    return {"commit": sha or "unknown", "commit_short": sha[:7] if sha else "unknown",
+            "deployment_id": (os.getenv("RAILWAY_DEPLOYMENT_ID") or "").strip() or "unknown",
+            "started_at": PROCESS_STARTED_AT.astimezone(ZoneInfo("America/New_York")).isoformat(timespec="seconds")}
 
 
 def _f(x: Any) -> Optional[float]:
@@ -90,7 +105,7 @@ def create_app(runtime: Optional[Runtime] = None, start_engine: bool = True) -> 
         s = rt.settings
         out: dict[str, Any] = {"service": "hk_connection", "mode": "paper", "error": rt.error,
                                "engine_running": bool(rt.scheduler and rt.scheduler.thread and rt.scheduler.thread.is_alive()),
-                               "warnings": s.warnings if s else []}
+                               "warnings": s.warnings if s else [], "version": deployed_version()}
         if s:
             out["settings"] = {"capital_base_env": s.capital_base, "shorts_enabled": s.shorts_enabled,
                                "trail_ema": s.trail_ema, "watchlist_max": s.watchlist_max,

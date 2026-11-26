@@ -220,6 +220,20 @@ def on_watchlist(ticker):
 
 ET = pytz.timezone("America/New_York")
 
+# === Deployed version (read-only, shown on /status) ===
+# Railway sets RAILWAY_GIT_COMMIT_SHA (and RAILWAY_DEPLOYMENT_ID) automatically on GitHub-triggered
+# deploys, so no env var needs to be added. Anywhere else this reads "unknown".
+PROCESS_STARTED_AT = datetime.now(pytz.utc)
+
+def deployed_version():
+    sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    return {
+        "commit": sha or "unknown",
+        "commit_short": sha[:7] if sha else "unknown",
+        "deployment_id": (os.getenv("RAILWAY_DEPLOYMENT_ID") or "").strip() or "unknown",
+        "started_at": PROCESS_STARTED_AT.astimezone(ET).isoformat(timespec="seconds"),
+    }
+
 def now_et():
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
@@ -961,9 +975,10 @@ def status():
             "industry": {name: industry_note(name) for name in sorted(WATCHLIST)},
             "shorts_enabled": SHORTS_ENABLED,
             "max_positions": MAX_POSITIONS,
+            "version": deployed_version(),
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": str(e), "version": deployed_version()}
 
 @app.get("/signals")
 def signals():
