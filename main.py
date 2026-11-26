@@ -10,8 +10,10 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 import os
+import threading
+import time as time_module
 import pytz
 import sqlite3
 from pathlib import Path
@@ -574,9 +576,366 @@ def regime_veto_refusal(action: str, ticker: str, reading: dict):
         },
     )
 
+# === GTC STOP RENEWAL (Alpaca's 90-day aged-order policy) ===
+# Alpaca cancels every GTC order 90 days after it was created (at 4:15 pm ET on the order's
+# `expires_at` date). Replacing an order does not help: the replacement inherits the old
+# expires_at. So once a day, before the open, each live protective stop that is older than
+# STOP_RENEW_AFTER_DAYS (or expires within STOP_RENEW_WITHIN_DAYS) is cancelled and immediately
+# re-placed as a new GTC stop at the SAME stop price, same side, same quantity.
+#
+# Why cancel-then-place (not place-then-cancel): Alpaca will not accept a second sell order for
+# shares that are already reserved by the old stop, so the new stop can only go in after the old
+# one is confirmed cancelled. The gap is a second or two, and the job runs pre-market, when
+# Alpaca stop orders cannot trigger anyway (they only trigger in regular hours), so the
+# position is never exposed during a session in which the old stop could have fired.
+#
+# Fallbacks (modelled on HK Connection's guarded refresh):
+#  - Price already through the stop before we start: leave the old stop alone (it is still live
+#    and will fire at the open) and record it. Nothing is cancelled.
+#  - The old stop filled while we were cancelling: nothing to re-place; recorded.
+#  - The new stop is rejected because the price is through it: submit a DAY market exit for the
+#    same quantity (exactly what the stop would have done; queued for the open if pre-market).
+#  - Any other failure: the stop is saved as a pending repair (in SQLite, so it survives a
+#    restart) and retried every minute until it is placed.
+# Stop prices are never changed. No risk rule is read or changed here.
+STOP_RENEW_AFTER_DAYS = 80
+STOP_RENEW_WITHIN_DAYS = 10
+STOP_RENEWAL_START_ET = dtime(9, 0)     # first try: pre-market
+STOP_RENEWAL_LATEST_ET = dtime(15, 45)  # catch-up window if the app was down at 9:00
+STOP_RENEWAL_LOOP_SECONDS = 60
+STOP_CANCEL_WAIT_SECONDS = 5.0
+STOP_RENEWAL_STATE = {"thread_started": False, "last_run_date": None, "last_run_at": None,
+                      "last_result": None, "last_error": None}
+STOP_RENEWAL_LOCK = threading.Lock()
+RENEWABLE_STOP_STATUSES = ("new", "accepted", "partially_filled")  # live, active stops (not held legs)
+
+
+def init_stop_renewal_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stop_renewals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT, symbol TEXT, side TEXT, qty INTEGER, stop_price REAL,
+                old_order_id TEXT, new_order_id TEXT, result TEXT, detail TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stop_renewal_pending (
+                symbol TEXT PRIMARY KEY, side TEXT, qty INTEGER, stop_price REAL,
+                old_order_id TEXT, since TEXT, attempts INTEGER, last_error TEXT
+            )
+        """)
+        conn.commit()
+
+
+def record_stop_renewal(symbol, side, qty, stop_price, old_id, new_id, result, detail=""):
+    row = {"time": datetime.now(ET).isoformat(), "symbol": symbol, "side": side, "qty": qty,
+           "stop_price": stop_price, "old_order_id": old_id, "new_order_id": new_id,
+           "result": result, "detail": detail}
+    print(f"STOP_RENEWAL {result} {symbol} {side} qty={qty} stop={stop_price} old={old_id} new={new_id} {detail}")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO stop_renewals (time, symbol, side, qty, stop_price, old_order_id, new_order_id, result, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["time"], symbol, side, qty, stop_price, old_id, new_id, result, detail))
+            conn.commit()
+    except Exception as e:
+        print(f"LOG_ERROR record_stop_renewal failed: {e}")
+    return row
+
+
+def recent_stop_renewals(limit=20):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM stop_renewals ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def pending_stop_repairs():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute("SELECT * FROM stop_renewal_pending ORDER BY since").fetchall()]
+    except Exception:
+        return []
+
+
+def save_pending_repair(symbol, side, qty, stop_price, old_id, error):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO stop_renewal_pending (symbol, side, qty, stop_price, old_order_id, since, attempts, last_error)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(symbol) DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error
+        """, (symbol, side, qty, stop_price, old_id, datetime.now(ET).isoformat(), error))
+        conn.commit()
+
+
+def clear_pending_repair(symbol):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM stop_renewal_pending WHERE symbol = ?", (symbol,))
+        conn.commit()
+
+
+def _as_dt(value):
+    """Order timestamps arrive as datetimes from alpaca-py; accept ISO strings too. Always tz-aware."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = pytz.utc.localize(value)
+    return value
+
+
+def stop_renewal_due(order, now):
+    """(due, info). Due when Alpaca will cancel it within STOP_RENEW_WITHIN_DAYS (expires_at),
+    or, if expires_at is missing, when it was created at least STOP_RENEW_AFTER_DAYS ago."""
+    expires = _as_dt(getattr(order, "expires_at", None))
+    created = _as_dt(getattr(order, "created_at", None) or getattr(order, "submitted_at", None))
+    info = {}
+    if created is not None:
+        info["age_days"] = round((now - created).total_seconds() / 86400.0, 1)
+    if expires is not None:
+        info["expires_at"] = expires.isoformat()
+        info["days_to_expiry"] = round((expires - now).total_seconds() / 86400.0, 1)
+        return info["days_to_expiry"] <= STOP_RENEW_WITHIN_DAYS, info
+    if created is not None:
+        return info["age_days"] >= STOP_RENEW_AFTER_DAYS, info
+    return False, {"note": "no created_at/expires_at on order; cannot age it"}
+
+
+def list_renewable_stops(client):
+    """Live, active stop orders on the account (including OTO stop legs once the entry has filled)."""
+    out, seen = [], set()
+    for req in (GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500),
+                GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True)):
+        try:
+            orders = client.get_orders(req)
+        except Exception:
+            continue
+        for o in _flatten_orders(orders):
+            oid = str(getattr(o, "id", ""))
+            if not oid or oid in seen:
+                continue
+            if not is_stop_order(o) or order_status_str(o) not in RENEWABLE_STOP_STATUSES:
+                continue
+            seen.add(oid)
+            out.append(o)
+    return out
+
+
+def latest_trade_price(ticker):
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+        data_client = StockHistoricalDataClient(get_alpaca_key(), get_alpaca_secret())
+        trade = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
+        return float(trade[ticker].price)
+    except Exception:
+        return None
+
+
+def stop_is_through(side, price, stop_price):
+    """True when the market is already at/through the stop (a sell stop at/above price, a buy stop at/below)."""
+    if price is None or stop_price is None:
+        return False
+    return price <= stop_price if side == "sell" else price >= stop_price
+
+
+def is_stop_through_market_error(err):
+    text = str(err).lower()
+    return "stop price" in text and any(k in text for k in (
+        "must be less than", "must be greater than", "must not be greater", "must not be less",
+        "base price", "current price", "market price"))
+
+
+def wait_for_cancel(client, order_id, timeout=None, sleep=time_module.sleep):
+    """Poll until the order is no longer live. Returns its final status string."""
+    timeout = STOP_CANCEL_WAIT_SECONDS if timeout is None else timeout
+    waited = 0.0
+    status = "unknown"
+    while True:
+        try:
+            status = order_status_str(client.get_order_by_id(order_id))
+        except Exception:
+            status = "unknown"
+        if status in ("canceled", "cancelled", "filled", "expired", "replaced", "rejected"):
+            return status
+        if waited >= timeout:
+            return status
+        sleep(0.25)
+        waited += 0.25
+
+
+def build_renewal_stop(symbol, side, qty, stop_price):
+    return StopOrderRequest(
+        symbol=symbol, qty=qty, side=OrderSide.SELL if side == "sell" else OrderSide.BUY,
+        time_in_force=TimeInForce.GTC, stop_price=round(float(stop_price), 2),
+    )
+
+
+def place_renewal_stop(client, symbol, side, qty, stop_price, old_id, context="renewal"):
+    """Place the replacement GTC stop, with the fallbacks described above. Returns a result row."""
+    last_err = None
+    for _ in range(2):
+        try:
+            new = client.submit_order(build_renewal_stop(symbol, side, qty, stop_price))
+            clear_pending_repair(symbol)
+            return record_stop_renewal(symbol, side, qty, stop_price, old_id, str(getattr(new, "id", "")),
+                                       "renewed" if context == "renewal" else "repaired")
+        except Exception as e:
+            last_err = e
+            px = latest_trade_price(symbol)
+            if is_stop_through_market_error(e) or stop_is_through(side, px, stop_price):
+                try:
+                    exit_order = client.submit_order(MarketOrderRequest(
+                        symbol=symbol, qty=qty, side=OrderSide.SELL if side == "sell" else OrderSide.BUY,
+                        time_in_force=TimeInForce.DAY))
+                    clear_pending_repair(symbol)
+                    return record_stop_renewal(symbol, side, qty, stop_price, old_id, str(getattr(exit_order, "id", "")),
+                                               "stop_through_market_exit",
+                                               f"new stop rejected ({e}); last={px}; market exit submitted")
+                except Exception as e2:
+                    last_err = e2
+                    break
+    save_pending_repair(symbol, side, qty, stop_price, old_id, str(last_err))
+    return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "place_failed_pending_retry", str(last_err))
+
+
+def renew_stop(client, order, now, sleep=time_module.sleep):
+    symbol = str(getattr(order, "symbol", "")).upper()
+    side = order_side_str(order)
+    old_id = str(getattr(order, "id", ""))
+    try:
+        stop_price = float(getattr(order, "stop_price", None))
+        qty = int(round(float(getattr(order, "qty", 0) or 0) - float(getattr(order, "filled_qty", 0) or 0)))
+    except Exception:
+        return record_stop_renewal(symbol, side, None, None, old_id, None, "skipped_bad_order", "missing qty/stop_price")
+    held = get_position_qty(client, symbol)
+    if (side == "sell" and held <= 0) or (side == "buy" and held >= 0):
+        return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "skipped_no_position")
+    qty = min(qty, int(abs(held)))
+    if qty <= 0:
+        return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "skipped_zero_qty")
+    px = latest_trade_price(symbol)
+    if stop_is_through(side, px, stop_price):
+        # Old stop is still live and will trigger at the open: do not cancel it.
+        return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "skipped_price_through_stop",
+                                   f"last={px}; existing stop left in place")
+    try:
+        client.cancel_order_by_id(old_id)
+    except Exception as e:
+        st = wait_for_cancel(client, old_id, timeout=0, sleep=sleep)
+        if st == "filled":
+            return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "old_stop_filled")
+        if st not in ("canceled", "cancelled", "expired"):
+            return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "cancel_failed_left_in_place", str(e))
+    st = wait_for_cancel(client, old_id, sleep=sleep)
+    if st == "filled":
+        return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "old_stop_filled")
+    held = get_position_qty(client, symbol)  # re-check: a fill may have happened while cancelling
+    if (side == "sell" and held <= 0) or (side == "buy" and held >= 0):
+        return record_stop_renewal(symbol, side, qty, stop_price, old_id, None, "position_closed_during_renewal")
+    qty = min(qty, int(abs(held)))
+    return place_renewal_stop(client, symbol, side, qty, stop_price, old_id)
+
+
+def run_stop_renewal(client=None, now=None, sleep=time_module.sleep):
+    """Renew every due stop once. Safe to call repeatedly (fresh stops are simply not due)."""
+    with STOP_RENEWAL_LOCK:
+        client = client or get_trading_client()
+        now = now or datetime.now(ET)
+        results, checked = [], 0
+        for o in list_renewable_stops(client):
+            checked += 1
+            due, info = stop_renewal_due(o, now)
+            if not due:
+                continue
+            try:
+                row = renew_stop(client, o, now, sleep=sleep)
+            except Exception as e:
+                row = record_stop_renewal(str(getattr(o, "symbol", "")), order_side_str(o), None,
+                                          getattr(o, "stop_price", None), str(getattr(o, "id", "")), None,
+                                          "error", str(e))
+            row.update(info)
+            results.append(row)
+        summary = {"at": now.isoformat(), "stops_checked": checked, "renewed_or_handled": len(results),
+                   "results": results}
+        STOP_RENEWAL_STATE["last_result"] = summary
+        STOP_RENEWAL_STATE["last_run_at"] = now.isoformat()
+        return summary
+
+
+def retry_pending_repairs(client=None, sleep=time_module.sleep):
+    pending = pending_stop_repairs()
+    if not pending:
+        return []
+    out = []
+    with STOP_RENEWAL_LOCK:
+        client = client or get_trading_client()
+        for p in pending:
+            held = get_position_qty(client, p["symbol"])
+            if (p["side"] == "sell" and held <= 0) or (p["side"] == "buy" and held >= 0):
+                clear_pending_repair(p["symbol"])
+                out.append(record_stop_renewal(p["symbol"], p["side"], p["qty"], p["stop_price"],
+                                               p["old_order_id"], None, "repair_dropped_no_position"))
+                continue
+            qty = min(int(p["qty"]), int(abs(held)))
+            out.append(place_renewal_stop(client, p["symbol"], p["side"], qty, p["stop_price"],
+                                          p["old_order_id"], context="repair"))
+    return out
+
+
+def stop_renewal_tick(now=None, client=None):
+    """One scheduler step: retry any pending repairs, then run the daily renewal if it is due."""
+    now = now or datetime.now(ET)
+    ran = []
+    try:
+        if pending_stop_repairs():
+            retry_pending_repairs(client)
+            ran.append("repairs")
+        today = now.date().isoformat()
+        if (now.weekday() < 5 and STOP_RENEWAL_STATE["last_run_date"] != today
+                and STOP_RENEWAL_START_ET <= now.time() <= STOP_RENEWAL_LATEST_ET):
+            STOP_RENEWAL_STATE["last_run_date"] = today
+            run_stop_renewal(client, now)
+            ran.append("renewal")
+        STOP_RENEWAL_STATE["last_error"] = None
+    except Exception as e:
+        STOP_RENEWAL_STATE["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"STOP_RENEWAL tick failed: {e}")
+    return ran
+
+
+def _stop_renewal_loop():
+    while True:
+        stop_renewal_tick()
+        time_module.sleep(STOP_RENEWAL_LOOP_SECONDS)
+
+
+def start_stop_renewal_thread():
+    if STOP_RENEWAL_STATE["thread_started"]:
+        return None
+    t = threading.Thread(target=_stop_renewal_loop, name="stop-renewal", daemon=True)
+    t.start()
+    STOP_RENEWAL_STATE["thread_started"] = True
+    return t
+
+
 @app.on_event("startup")
 def startup():
     init_db()
+    init_stop_renewal_db()
+    start_stop_renewal_thread()
 
 @app.get("/")
 def root():
@@ -881,6 +1240,21 @@ def industry():
     return {
         "feed": INDUSTRY_FEED,
         "map": {name: industry_note(name) for name in sorted(WATCHLIST)},
+    }
+
+@app.get("/stops/renewal")
+def stops_renewal():
+    """Read-only: what the daily GTC stop renewal did last, and any stop still waiting to be re-placed."""
+    return {
+        "renew_after_days": STOP_RENEW_AFTER_DAYS,
+        "renew_within_days_of_expiry": STOP_RENEW_WITHIN_DAYS,
+        "schedule_et": f"weekdays from {STOP_RENEWAL_START_ET.strftime('%H:%M')} (catch-up until {STOP_RENEWAL_LATEST_ET.strftime('%H:%M')})",
+        "thread_started": STOP_RENEWAL_STATE["thread_started"],
+        "last_run_at": STOP_RENEWAL_STATE["last_run_at"],
+        "last_result": STOP_RENEWAL_STATE["last_result"],
+        "last_error": STOP_RENEWAL_STATE["last_error"],
+        "pending_repairs": pending_stop_repairs(),
+        "recent": recent_stop_renewals(20),
     }
 
 @app.post("/webhook")
