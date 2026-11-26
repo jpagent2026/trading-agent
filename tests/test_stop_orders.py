@@ -19,7 +19,7 @@ def main(tmp_path, monkeypatch):
     # Env only inside tests: dummy paper creds; make sure defaults for sizing/limits apply.
     monkeypatch.setenv("ALPACA_API_KEY", "test-key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test-secret")
-    for var in ("TEST_QTY", "RISK_PCT", "MAX_POSITION_PCT", "MIN_STOP_PCT", "MAX_TRADES_PER_DAY",
+    for var in ("RISK_PCT", "MAX_POSITION_PCT", "MIN_STOP_PCT", "MAX_TRADES_PER_DAY",
                 "MAX_POSITIONS", "DAILY_LOSS_LIMIT_PCT", "SHORTS_ENABLED"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.syspath_prepend(str(REPO_ROOT))
@@ -127,10 +127,20 @@ def test_pending_non_stop_order_still_blocks(main):
 
 
 def test_buy_without_stop_is_rejected_no_3_share_fallback(main):
-    # The old unprotected fixed-size (TEST_QTY=3) fallback for stop-less buys is gone.
+    # The old unprotected fixed 3-share fallback for stop-less buys is gone (its setting was removed).
     client = make_client()
     resp = post_approve(main, client, {"action": "buy", "ticker": "PSX"})
     assert resp.status_code == 422
     body = resp.json()
     assert body["status"] == "rejected" and body["reason"] == "stop_required", body
+    client.submit_order.assert_not_called()
+
+
+def test_test_qty_setting_is_gone_and_env_var_has_no_effect(main, monkeypatch):
+    # TEST_QTY was dead code after the stop-required change; it is removed entirely.
+    assert not hasattr(main, "TEST_QTY")
+    monkeypatch.setenv("TEST_QTY", "3")
+    client = make_client()
+    resp = post_approve(main, client, {"action": "buy", "ticker": "PSX"})
+    assert resp.status_code == 422 and resp.json()["reason"] == "stop_required"
     client.submit_order.assert_not_called()
